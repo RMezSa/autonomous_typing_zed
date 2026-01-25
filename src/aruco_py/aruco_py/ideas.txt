@@ -1,0 +1,2 @@
+1. Ajustar la permisibilidad del tracking del sistema para reconocer realmente cuando ya pierde la ubicación precisa de la tecla, econ el objetivo de que pase a estado global state otra vez, si detectamos que pasó a ese estado antes de apretar la tecla, nos regresamos e intentamos de nuevo el approach a la tecla
+

@@ -1,0 +1,20 @@
+# Generic Logitech 720p Webcam configuration
+# Resolution: up to 1280x720 @ 30fps
+
+v4l2_camera:
+  ros__parameters:
+    # Image format
+    image_size: [1280, 720]  # Native resolution
+    pixel_format: "mjpeg"    # More efficient than YUYV
+    camera_frame_id: "camera"
+    time_per_frame: [1, 30]  # 30 fps
+    
+    # Output format
+    output_encoding: "rgb8"
+    
+    # Camera info
+    camera_info_url: "file:///home/roberd/.ros/camera_info/logitech_720p.yaml"
+
+# Alternative resolutions:
+# Native: [1280, 720]
+# Performance mode: [640, 480]

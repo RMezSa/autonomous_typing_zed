@@ -1,0 +1,21 @@
+# Logitech C920 HD Pro configuration
+# Resolution: up to 1920x1080 @ 30fps (MJPEG)
+
+v4l2_camera:
+  ros__parameters:
+    # Image format
+    image_size: [1280, 720]  # Sweet spot for Jetson Orin Nano
+    pixel_format: "mjpeg"    # Hardware-accelerated
+    camera_frame_id: "camera"
+    time_per_frame: [1, 30]  # 30 fps
+    
+    # Output format
+    output_encoding: "rgb8"
+    
+    # Camera info
+    camera_info_url: "file:///home/roberd/.ros/camera_info/c920.yaml"
+
+# Alternative resolutions (comment/uncomment as needed):
+# High quality (more CPU): [1920, 1080]
+# Balanced (recommended): [1280, 720]
+# Performance mode: [640, 480]
