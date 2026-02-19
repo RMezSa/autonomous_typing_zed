@@ -10,50 +10,34 @@ All files have been successfully installed:
 
 ## Usage
 
-### 1. Launch with Logitech C920 (default)
+### 1. Launch ZED2i + ArUco node
 ```bash
 cd ~/ros2_ws
 source install/setup.bash
 ros2 launch aruco_py aruco_optimized.launch.py
 ```
 
-### 2. Launch with generic 720p camera
-```bash
-ros2 launch aruco_py aruco_optimized.launch.py camera_config:=camera_720p.yaml
-```
-
-### 3. Use different camera device
-```bash
-ros2 launch aruco_py aruco_optimized.launch.py device:=/dev/video2
-```
-
-### 4. Skip camera optimization (if already configured)
-```bash
-ros2 launch aruco_py aruco_optimized.launch.py optimize_camera:=false
-```
-
-### 5. Combine options
+### 2. Use a specific image topic
 ```bash
 ros2 launch aruco_py aruco_optimized.launch.py \
-  camera_config:=camera_720p.yaml \
-  device:=/dev/video2 \
-  optimize_camera:=true
+   image_topic:=/zed2i/zed_node/left/image_rect_color
+```
+
+### 3. Override ZED launch package or file
+```bash
+ros2 launch aruco_py aruco_optimized.launch.py \
+   zed_launch_package:=zed_wrapper \
+   zed_launch_file:=zed_camera.launch.py
 ```
 
 ## What Happens at Launch
 
-1. **Camera Optimization** (if `optimize_camera:=true`):
-   - Detects camera model automatically
-   - Applies optimal settings for ArUco detection
-   - Sets resolution, exposure, focus, gain
-   - Shows ✓/✗/⊘ status for each control
+1. **ZED Launch**:
+   - Starts the ZED2i launch file
+   - Publishes camera topics
 
-2. **Camera Launch**:
-   - Starts v4l2_camera node with config
-   - Publishes to `/image_raw` topic
-
-3. **ArUco Node**:
-   - Subscribes to camera feed
+2. **ArUco Node**:
+   - Subscribes to the configured image topic
    - Detects 4 ArUco markers (2cm, DICT_7X7_50)
    - Tracks keyboard and keys with dual-mode pipeline
    - Phase 1 optimizations active:
@@ -70,23 +54,9 @@ colcon build --packages-select aruco_py
 source install/setup.bash
 ```
 
-### Camera not detected
+### ZED image topic not found
 ```bash
-# List available cameras
-v4l2-ctl --list-devices
-
-# Test specific camera
-v4l2-ctl -d /dev/video0 --all
-```
-
-### Manual camera optimization
-```bash
-~/ros2_ws/install/aruco_py/share/aruco_py/scripts/optimize_camera.sh /dev/video0
-```
-
-### Permission denied on script
-```bash
-chmod +x ~/ros2_ws/install/aruco_py/share/aruco_py/scripts/optimize_camera.sh
+ros2 topic list
 ```
 
 ## Next Steps

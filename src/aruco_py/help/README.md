@@ -50,11 +50,7 @@ This package now includes **advanced ArUco marker detection optimizations** insp
 # 1. Launch with optimizations (enabled by default)
 ros2 launch aruco_py aruco_optimized.launch.py
 
-# 2. Run benchmark test
-cd ~/ros2_ws/src/aruco_py/scripts
-python3 test_optimizations.py
-
-# 3. Customize parameters
+# 2. Customize parameters
 nano ~/ros2_ws/src/aruco_py/config/aruco_advanced.yaml
 ```
 

@@ -2,12 +2,15 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 
 import cv2
 import numpy as np
 from typing import List, Tuple, Optional
 import time
+from collections import deque
 
 
 
@@ -17,16 +20,23 @@ class ArucoNode(Node):
 
         self.bridge = CvBridge()
 
+        self.declare_parameter('image_topic', '/image_raw')
+        image_topic = self.get_parameter('image_topic').value
+
         self.sub = self.create_subscription(
             Image,
-            '/image_raw',
+            image_topic,
             self.image_callback,
             10
         )
 
+        self.marker_pub = self.create_publisher(MarkerArray, 'markers', 10)
+        self.debug_image_pub = self.create_publisher(Image, 'debug_image', 10)
+        self.last_marker_ids = set()
+
         # ArUcos - Dictionary
         self.dictionary = cv2.aruco.getPredefinedDictionary(
-            cv2.aruco.DICT_7X7_50
+            cv2.aruco.DICT_4X4_50
         )
 
         # Advanced detector parameters (inspired by ros_aruco_opencv)
@@ -64,15 +74,19 @@ class ArucoNode(Node):
         self.parameters.detectInvertedMarker = True  # Support inverted markers
         
         # Image preprocessing configuration
-        self.use_clahe = True  # Contrast Limited Adaptive Histogram Equalization
+        self.use_clahe = False  # Contrast Limited Adaptive Histogram Equalization
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self.use_bilateral = False  # Bilateral filter (slower but better noise reduction)
         self.bilateral_d = 5
         self.bilateral_sigma_color = 50
         self.bilateral_sigma_space = 50
+
+        # ArUco reference corner: False means top-left (OpenCV default)
+        # Set True only if your marker uses bottom-right as the red reference.
+        self.marker_ref_is_bottom_right = False
         
         # Multi-threshold detection strategy
-        self.use_multi_threshold = True
+        self.use_multi_threshold = False
         self.threshold_methods = ['adaptive', 'otsu', 'fixed']
         self.fixed_threshold = 100
         
@@ -80,12 +94,12 @@ class ArucoNode(Node):
         self.use_ippe_square = True  # Better pose estimation with IPPE
         self.pose_selection_strategy = 'reprojection_error'  # or 'plane_normal'
         
-        self.get_logger().info("ArUco node started with optimized detection parameters")
+        self.get_logger().info("ArUco node started")
 
         # Pose stability parameters
         self.stable_frames = 0
         self.required_stable_frames = 90
-        self.stable_thresh_px = .1
+        self.stable_thresh_px = 3.0
         self.last_target_pos = None
 
         # --- State for robust detection ---
@@ -119,6 +133,12 @@ class ArucoNode(Node):
         self.keyboard_expected_area_ratio = 0.35
         self.keyboard_roi_pad_ratio = 0.03
         self.keyboard_fallback_expand_ratio = 0.2
+        # If the keyboard corner is close to the ROI corner (in warped ROI px), snap it
+        self.keyboard_corner_snap_px = 10 #27
+        # Marker must be close to the keyboard quad corner (in warped ROI px)
+        self.keyboard_marker_to_kb_corner_px = 90
+        # Debug overlay for snap behavior
+        self.keyboard_snap_debug = True
         # Keyboard black-surface segmentation (stage 3)
         self.keyboard_use_black_mask = True
         self.keyboard_black_v_thresh = 120
@@ -130,6 +150,17 @@ class ArucoNode(Node):
         self.target_key_label = "Space"
         # Runtime input buffer for changing target key
         self.input_buffer = ""
+        
+        # Autonomous typing queue (FIFO)
+        self.typing_queue = deque()
+        self.autonomous_mode = False
+        self.current_typing_target = None
+        self.typing_cooldown_until = 0.0
+        self.typing_cooldown_duration = 0.5
+        
+        # Homography stability for autonomous mode
+        self.homography_stable_frames = 0
+        self.homography_stable_required = 2
 
         # Optical flow fallback state
         self.prev_gray = None
@@ -185,11 +216,21 @@ class ArucoNode(Node):
 
         self.pose_lock = False
         self.pose_lock_threshold_px = 40
-        self.pose_lock_delay_sec = 2.0
+        self.pose_lock_delay_sec = 0.5
         self.pose_lock_start_time = None
+
+        # Require re-acquiring target after completing a letter
+        self.await_target_acquire = False
 
         # Homography stability tracking
         self.last_M_for_stability = None
+
+    def complete_current_key(self):
+        """Mark current typing target as completed and prepare for next"""
+        if self.autonomous_mode and self.current_typing_target is not None:
+            self.get_logger().info(f"Completed typing: '{self.current_typing_target}'")
+            self.current_typing_target = None
+            self.await_target_acquire = True
 
     def order_points(self, pts):
         # Orders 4 points as: top-left, top-right, bottom-right, bottom-left
@@ -203,6 +244,82 @@ class ArucoNode(Node):
         bl = pts[np.argmax(diff)]
 
         return np.array([tl, tr, br, bl], dtype="float32")
+
+    def snap_keyboard_quad_to_roi(self, keyboard_quad, M, fresh_markers, corner_ids, w_dst, h_dst):
+        if keyboard_quad is None or M is None:
+            return keyboard_quad, [False, False, False, False]
+
+        if not fresh_markers or corner_ids is None:
+            return keyboard_quad, [False, False, False, False]
+
+        tl_id, tr_id, br_id, bl_id = corner_ids
+        if tl_id not in fresh_markers or tr_id not in fresh_markers or br_id not in fresh_markers or bl_id not in fresh_markers:
+            return keyboard_quad, [False, False, False, False]
+
+        centers_frame = np.array([
+            np.mean(fresh_markers[tl_id][0], axis=0),
+            np.mean(fresh_markers[tr_id][0], axis=0),
+            np.mean(fresh_markers[br_id][0], axis=0),
+            np.mean(fresh_markers[bl_id][0], axis=0)
+        ], dtype=np.float32).reshape(-1, 1, 2)
+
+        centers_warp = cv2.perspectiveTransform(centers_frame, M).reshape(4, 2)
+
+        roi_corners = np.array(
+            [[0, 0], [w_dst - 1, 0], [w_dst - 1, h_dst - 1], [0, h_dst - 1]],
+            dtype=np.float32
+        )
+
+        adjusted = keyboard_quad.copy()
+        snapped = [False, False, False, False]
+        for i in range(4):
+            dist_marker_to_kb = np.linalg.norm(centers_warp[i] - keyboard_quad[i])
+            dist_kb_to_roi = np.linalg.norm(keyboard_quad[i] - roi_corners[i])
+            if dist_marker_to_kb <= self.keyboard_marker_to_kb_corner_px and dist_kb_to_roi <= self.keyboard_corner_snap_px:
+                adjusted[i] = roi_corners[i]
+                snapped[i] = True
+
+        return adjusted, snapped
+
+    def draw_snap_debug(self, warped_roi, snapped, w_dst, h_dst):
+        if warped_roi is None:
+            return
+
+        has_snap = bool(snapped) and any(snapped)
+
+        if not has_snap:
+            cv2.putText(
+                warped_roi, "SNAP INACTIVE",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (0, 255, 255), 2
+            )
+            return
+
+        labels = ["TL", "TR", "BR", "BL"]
+        roi_corners = np.array(
+            [[0, 0], [w_dst - 1, 0], [w_dst - 1, h_dst - 1], [0, h_dst - 1]],
+            dtype=np.float32
+        )
+
+        cv2.putText(
+            warped_roi, "SNAP ACTIVE",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7, (0, 0, 255), 2
+        )
+
+        for i, flag in enumerate(snapped):
+            if not flag:
+                continue
+            x, y = int(roi_corners[i][0]), int(roi_corners[i][1])
+            cv2.circle(warped_roi, (x, y), 6, (0, 0, 255), -1)
+            cv2.putText(
+                warped_roi, f"SNAP {labels[i]}",
+                (x + 6, y + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 0, 255), 2
+            )
 
     def build_keyboard_layout(self):
         layout = []
@@ -609,8 +726,33 @@ class ArucoNode(Node):
     def image_callback(self, msg):
         # ROS Image -> OpenCV
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        header = msg.header
+        h, w = frame.shape[:2]
+        if w >= 2 * h:
+            # Side-by-side stereo: keep only left camera image
+            frame = frame[:, :w // 2]
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         now_sec = self.get_clock().now().nanoseconds * 1e-9
+        
+        # Autonomous mode: consume queue when ready for next target
+        if self.autonomous_mode and not self.key_track_active and self.current_typing_target is None and now_sec > self.typing_cooldown_until:
+            # Wait for stable homography before starting next letter
+            if self.homography_stable_frames >= self.homography_stable_required:
+                if self.typing_queue:
+                    self.current_typing_target = self.typing_queue.popleft()
+                    self.target_key_label = self.current_typing_target
+                    self.homography_stable_frames = 0  # Reset for next letter
+                    self.get_logger().info(f"Auto-typing next: '{self.current_typing_target}' (queue: {len(self.typing_queue)} remaining)")
+                else:
+                    # Queue empty, exit autonomous mode
+                    self.autonomous_mode = False
+                    self.current_typing_target = None
+                    self.target_key_label = ""
+                    self.await_target_acquire = False
+                    self.pose_lock_start_time = None
+                    self.get_logger().info("Autonomous typing completed")
+            else:
+                self.get_logger().info(f"Waiting for stable homography: {self.homography_stable_frames}/{self.homography_stable_required}", throttle_duration_sec=0.5)
 
         # Fine tracking mode: skip pose/warp/layout updates
         if self.key_track_active:
@@ -674,8 +816,33 @@ class ArucoNode(Node):
                 if key != 255:
                     if key in (10, 13):
                         if self.input_buffer:
-                            self.target_key_label = self.input_buffer
-                            self.get_logger().info(f"Target key set to: {self.target_key_label}")
+                            raw_input = self.input_buffer.strip()
+                            if raw_input.startswith('>'):
+                                raw_input = raw_input[1:].strip()
+
+                            if len(raw_input) > 1:
+                                self.typing_queue.clear()
+                                for char in raw_input.lower():
+                                    if char.strip():
+                                        self.typing_queue.append(char)
+                                if self.typing_queue:
+                                    self.autonomous_mode = True
+                                    self.current_typing_target = self.typing_queue.popleft()
+                                    self.target_key_label = self.current_typing_target
+                                    self.homography_stable_frames = 0
+                                    self.pose_lock_start_time = None
+                                    self.await_target_acquire = True
+                                    self.get_logger().info(
+                                        f"Autonomous typing queued: {raw_input} ({len(self.typing_queue)} chars)"
+                                    )
+                            else:
+                                self.target_key_label = raw_input
+                                self.autonomous_mode = False
+                                self.typing_queue.clear()
+                                self.current_typing_target = None
+                                self.await_target_acquire = True
+                                self.get_logger().info(f"Target key set to: {self.target_key_label}")
+
                             self.input_buffer = ""
                             self.key_track_active = False
                             self.key_track_point = None
@@ -688,12 +855,30 @@ class ArucoNode(Node):
                             self.layout_lock_K = None
                             self.layout_lock_K_inv = None
                             self.layout_lock_quad = None
+                    elif key in (ord('d'), ord('D')):
+                        if self.autonomous_mode and self.current_typing_target is not None:
+                            self.get_logger().info(f"DONE: '{self.current_typing_target}'")
+                            self.complete_current_key()
+                            self.typing_cooldown_until = now_sec + self.typing_cooldown_duration
+                            self.key_track_active = False
+                            self.key_track_point = None
+                            self.key_track_lost = 0
+                            self.target_kf_initialized = False
+                            self.target_kf_last_time = None
+                            self.pose_lock_start_time = None
+                            self.layout_locked = False
+                            self.layout_lock_M = None
+                            self.layout_lock_M_inv = None
+                            self.layout_lock_K = None
+                            self.layout_lock_K_inv = None
+                            self.layout_lock_quad = None
                     elif key in (8, 127):
                         self.input_buffer = self.input_buffer[:-1]
                     elif 32 <= key <= 126:
                         self.input_buffer += chr(key)
 
                 self.prev_gray = gray_frame
+                self.publish_debug_image(frame, header)
                 if self.key_track_active:
                     return
             else:
@@ -717,6 +902,9 @@ class ArucoNode(Node):
         if ids is not None:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
             for marker_id, marker_corners in zip(ids.flatten(), corners):
+                if self.marker_ref_is_bottom_right and marker_corners is not None and marker_corners.shape[1] == 4:
+                    # Rotate corners so bottom-right reference becomes top-left
+                    marker_corners = np.roll(marker_corners, -2, axis=1)
                 self.last_known_corners[marker_id] = marker_corners
                 self.last_seen_timestamp[marker_id] = now_sec
         
@@ -737,6 +925,7 @@ class ArucoNode(Node):
         keyboard_quad = None
         roi_debug = None
         w_dst, h_dst = 800, 400
+        corner_ids = None
 
         # 2. Proceed if we have exactly 4 fresh markers
         if aruco_visible and not self.key_track_active:
@@ -754,6 +943,8 @@ class ArucoNode(Node):
             tr_id, _ = top_row[1]
             bl_id, _ = bottom_row[0]
             br_id, _ = bottom_row[1]
+
+            corner_ids = (tl_id, tr_id, br_id, bl_id)
 
             pts_src = np.array([
                 fresh_markers[tl_id][0][0],
@@ -779,12 +970,15 @@ class ArucoNode(Node):
                 delta = np.mean(np.linalg.norm(cur - prev, axis=2))
                 if delta <= self.stable_thresh_px:
                     self.stable_frames += 1
+                    self.homography_stable_frames += 1
                 else:
                     self.stable_frames = 0
                     self.last_target_pos = None
+                    self.homography_stable_frames = 0
             else:
                 self.stable_frames = 0
                 self.last_target_pos = None
+                self.homography_stable_frames = 0
 
             self.last_M_for_stability = M.copy()
 
@@ -805,6 +999,19 @@ class ArucoNode(Node):
                     )
 
                 if keyboard_quad is not None:
+                    if aruco_visible and corner_ids is not None:
+                        keyboard_quad, snap_flags = self.snap_keyboard_quad_to_roi(
+                            keyboard_quad, M, fresh_markers, corner_ids, w_dst, h_dst
+                        )
+                        if self.keyboard_snap_debug:
+                            self.draw_snap_debug(warped_roi, snap_flags, w_dst, h_dst)
+                            if any(snap_flags):
+                                labels = ["TL", "TR", "BR", "BL"]
+                                active = [labels[i] for i, f in enumerate(snap_flags) if f]
+                                self.get_logger().info(
+                                    f"Snap active: {','.join(active)}",
+                                    throttle_duration_sec=1.0
+                                )
                     quad_frame = cv2.perspectiveTransform(
                         keyboard_quad.reshape(4, 1, 2).astype(np.float32), M_inv
                     ).reshape(4, 2)
@@ -886,6 +1093,7 @@ class ArucoNode(Node):
                     cv2.putText(frame, f"STATE: {self.status_text}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                     cv2.imshow("ArUco Detection", frame)
                     self.prev_gray = gray_frame
+                    self.publish_debug_image(frame, header)
                     return
 
                 if not self.layout_locked and keyboard_quad is None and warped_roi is not None:
@@ -909,6 +1117,19 @@ class ArucoNode(Node):
                         keyboard_quad = self.last_keyboard_quad
 
                 if keyboard_quad is not None:
+                    if aruco_visible and corner_ids is not None:
+                        keyboard_quad, snap_flags = self.snap_keyboard_quad_to_roi(
+                            keyboard_quad, M, fresh_markers, corner_ids, w_dst, h_dst
+                        )
+                        if self.keyboard_snap_debug:
+                            self.draw_snap_debug(warped_roi, snap_flags, w_dst, h_dst)
+                            if any(snap_flags):
+                                labels = ["TL", "TR", "BR", "BL"]
+                                active = [labels[i] for i, f in enumerate(snap_flags) if f]
+                                self.get_logger().info(
+                                    f"Snap active: {','.join(active)}",
+                                    throttle_duration_sec=1.0
+                                )
                     # Build canonical keyboard space
                     kb_w, kb_h = self.keyboard_size
                     kb_dst = np.array(
@@ -1018,6 +1239,10 @@ class ArucoNode(Node):
 
 
                     if target_real is not None:
+                        if self.await_target_acquire:
+                            self.await_target_acquire = False
+                            self.homography_stable_frames = 0
+                            self.pose_lock_start_time = None
                         if self.target_kf_last_time is None:
                             dt = 1.0 / 30.0
                         else:
@@ -1036,13 +1261,20 @@ class ArucoNode(Node):
                         dx = tx - cx_frame
                         dy = ty - cy_frame
 
-                        if aruco_visible:
-                            self.pose_lock = True
-                        else:
-                            self.pose_lock = (abs(dx) < self.pose_lock_threshold_px and
-                                              abs(dy) < self.pose_lock_threshold_px)
+                        stable_ready = aruco_visible and (
+                            self.homography_stable_frames >= self.homography_stable_required
+                        )
 
-                        if self.pose_lock and not self.key_track_active:
+                        if self.autonomous_mode and self.current_typing_target is not None:
+                            self.pose_lock = stable_ready
+                        else:
+                            if aruco_visible:
+                                self.pose_lock = stable_ready
+                            else:
+                                self.pose_lock = (abs(dx) < self.pose_lock_threshold_px and
+                                                  abs(dy) < self.pose_lock_threshold_px)
+
+                        if self.pose_lock and not self.key_track_active and not self.await_target_acquire:
                             if self.pose_lock_start_time is None:
                                 self.pose_lock_start_time = now_sec
 
@@ -1124,15 +1356,50 @@ class ArucoNode(Node):
         else:
             self.get_logger().info(f"Found {len(fresh_markers)} fresh markers, waiting for exactly 4.", throttle_duration_sec=1.0)
 
+        # Display autonomous mode status
+        if self.autonomous_mode:
+            queue_display = ''.join(list(self.typing_queue)[:10])  # Show first 10 chars
+            cv2.putText(frame, f"AUTO: [{self.current_typing_target}] Queue: {queue_display}", 
+                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
         cv2.putText(frame, f"STATE: {self.status_text}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        self.publish_markers(corners, ids, header)
+        self.publish_debug_image(frame, header)
         cv2.imshow("ArUco Detection", frame)
-        # Runtime input: type key label and press Enter to set target
+        
+        # Runtime input: type key label/word and press Enter
         key = cv2.waitKey(1) & 0xFF
         if key != 255:
             if key in (10, 13):  # Enter
                 if self.input_buffer:
-                    self.target_key_label = self.input_buffer
-                    self.get_logger().info(f"Target key set to: {self.target_key_label}")
+                    raw_input = self.input_buffer.strip()
+                    if raw_input.startswith('>'):
+                        raw_input = raw_input[1:].strip()
+
+                    if len(raw_input) > 1:
+                        self.typing_queue.clear()
+                        for char in raw_input.lower():
+                            if char.strip():
+                                self.typing_queue.append(char)
+                        if self.typing_queue:
+                            self.autonomous_mode = True
+                            self.current_typing_target = self.typing_queue.popleft()
+                            self.target_key_label = self.current_typing_target
+                            self.homography_stable_frames = 0
+                            self.pose_lock_start_time = None
+                            self.await_target_acquire = True
+                            self.get_logger().info(
+                                f"Autonomous typing queued: {raw_input} ({len(self.typing_queue)} chars)"
+                            )
+                    else:
+                        # Single key mode
+                        self.target_key_label = raw_input
+                        self.autonomous_mode = False
+                        self.typing_queue.clear()
+                        self.current_typing_target = None
+                        self.await_target_acquire = True
+                        self.get_logger().info(f"Target key set to: {self.target_key_label}")
+                    
                     self.input_buffer = ""
                     self.key_track_active = False
                     self.key_track_point = None
@@ -1151,6 +1418,51 @@ class ArucoNode(Node):
                 self.input_buffer += chr(key)
 
         self.prev_gray = gray_frame
+
+    def publish_markers(self, corners, ids, header):
+        marker_array = MarkerArray()
+        current_ids = set()
+
+        if ids is not None:
+            for marker_id, marker_corners in zip(ids.flatten(), corners):
+                marker_id_int = int(marker_id)
+                current_ids.add(marker_id_int)
+
+                marker = Marker()
+                marker.header = header
+                marker.ns = 'aruco'
+                marker.id = marker_id_int
+                marker.type = Marker.LINE_STRIP
+                marker.action = Marker.ADD
+                marker.pose.orientation.w = 1.0
+                marker.scale.x = 2.0
+                marker.color.r = 0.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                marker.color.a = 1.0
+
+                pts = marker_corners.reshape(4, 2)
+                for x, y in pts:
+                    marker.points.append(Point(x=float(x), y=float(y), z=0.0))
+                marker.points.append(Point(x=float(pts[0][0]), y=float(pts[0][1]), z=0.0))
+
+                marker_array.markers.append(marker)
+
+        for marker_id in self.last_marker_ids - current_ids:
+            marker = Marker()
+            marker.header = header
+            marker.ns = 'aruco'
+            marker.id = int(marker_id)
+            marker.action = Marker.DELETE
+            marker_array.markers.append(marker)
+
+        self.marker_pub.publish(marker_array)
+        self.last_marker_ids = current_ids
+
+    def publish_debug_image(self, frame, header):
+        debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        debug_msg.header = header
+        self.debug_image_pub.publish(debug_msg)
 
 
 def main():

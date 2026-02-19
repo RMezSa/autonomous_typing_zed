@@ -67,19 +67,6 @@ Complete technical documentation covering:
 - Implementation architecture
 - Future enhancement roadmap
 
-### 4. Testing Tools (`scripts/test_optimizations.py`)
-
-Benchmark script that compares three configurations:
-- **Original**: Baseline performance
-- **Optimized**: Balanced (recommended)
-- **Maximum**: All optimizations enabled
-
-Provides metrics:
-- Detection rate
-- Processing time
-- FPS capability
-- Recommendations
-
 ## Performance Characteristics
 
 ### Detection Improvements
@@ -107,13 +94,6 @@ Provides metrics:
 ```bash
 # The node now uses optimized parameters by default
 ros2 launch aruco_py aruco_optimized.launch.py
-```
-
-### Test the Improvements
-```bash
-# Run benchmark comparison
-cd ~/ros2_ws/src/aruco_py/scripts
-python3 test_optimizations.py
 ```
 
 ### Customize Parameters
@@ -148,7 +128,6 @@ self.pose_selection_strategy = 'reprojection_error'  # Pose selection
 ### New Files
 - `config/aruco_advanced.yaml` - Comprehensive parameter configuration
 - `ARUCO_OPTIMIZATIONS.md` - Technical documentation
-- `scripts/test_optimizations.py` - Benchmark tool
 
 ### Modified Files
 - `aruco_py/aruco_node.py` - Enhanced with optimization methods
@@ -198,14 +177,9 @@ adaptive_thresh_constant: 5
    ros2 launch aruco_py aruco_optimized.launch.py
    ```
 
-2. **Run Benchmark**: Compare performance metrics
-   ```bash
-   python3 ~/ros2_ws/src/aruco_py/scripts/test_optimizations.py
-   ```
+2. **Fine-Tune**: Adjust parameters in `aruco_advanced.yaml` for your specific setup
 
-3. **Fine-Tune**: Adjust parameters in `aruco_advanced.yaml` for your specific setup
-
-4. **Monitor Performance**: Watch for detection rate and FPS in challenging conditions
+3. **Monitor Performance**: Watch for detection rate and FPS in challenging conditions
 
 ## Troubleshooting
 

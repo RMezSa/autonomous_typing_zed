@@ -1,61 +1,47 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-import os
 
 def generate_launch_description():
     # Declare arguments
-    camera_config_arg = DeclareLaunchArgument(
-        'camera_config',
-        default_value='camera_c920.yaml',
-        description='Camera config file (camera_c920.yaml or camera_720p.yaml)'
+    zed_launch_package_arg = DeclareLaunchArgument(
+        'zed_launch_package',
+        default_value='zed_wrapper',
+        description='ZED launch package name'
     )
-    
-    device_arg = DeclareLaunchArgument(
-        'device',
-        default_value='/dev/video0',
-        description='Camera device path'
+
+    zed_launch_file_arg = DeclareLaunchArgument(
+        'zed_launch_file',
+        default_value='zed_camera.launch.py',
+        description='ZED launch file name'
     )
-    
-    optimize_camera_arg = DeclareLaunchArgument(
-        'optimize_camera',
-        default_value='true',
-        description='Run camera optimization script before starting'
+
+    image_topic_arg = DeclareLaunchArgument(
+        'image_topic',
+        default_value='/image_raw',
+        description='Image topic for ArUco node'
     )
-    
-    # Get config file path
-    config_file = PathJoinSubstitution([
-        FindPackageShare('aruco_py'),
-        'config',
-        LaunchConfiguration('camera_config')
-    ])
-    
-    # Camera optimization script
-    optimize_script = PathJoinSubstitution([
-        FindPackageShare('aruco_py'),
-        'scripts',
-        'optimize_camera.sh'
-    ])
-    
-    # Camera optimization process (runs once at startup)
-    optimize_camera_process = ExecuteProcess(
-        cmd=[
-            'bash', optimize_script, LaunchConfiguration('device')
-        ],
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('optimize_camera'))
+
+    camera_model_arg = DeclareLaunchArgument(
+        'camera_model',
+        default_value='zed2i',
+        description='ZED camera model passed to the ZED launch file'
     )
-    
-    # Camera node
-    camera_node = Node(
-        package='v4l2_camera',
-        executable='v4l2_camera_node',
-        name='camera',
-        parameters=[config_file],
-        output='screen'
+
+    zed_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare(LaunchConfiguration('zed_launch_package')),
+                'launch',
+                LaunchConfiguration('zed_launch_file')
+            ])
+        ),
+        launch_arguments={
+            'camera_model': LaunchConfiguration('camera_model')
+        }.items()
     )
     
     # ArUco detection node
@@ -63,14 +49,15 @@ def generate_launch_description():
         package='aruco_py',
         executable='aruco_node',
         name='aruco_node',
+        parameters=[{'image_topic': LaunchConfiguration('image_topic')}],
         output='screen'
     )
     
     return LaunchDescription([
-        camera_config_arg,
-        device_arg,
-        optimize_camera_arg,
-        optimize_camera_process,
-        camera_node,
+        zed_launch_package_arg,
+        zed_launch_file_arg,
+        image_topic_arg,
+        camera_model_arg,
+        zed_launch,
         aruco_node,
     ])
