@@ -47,6 +47,11 @@ class ZedArucoNode(Node):
         else:
             self.parameters = cv2.aruco.DetectorParameters()
 
+        # Support for new ArUco API (OpenCV 4.7+)
+        self.detector = None
+        if hasattr(cv2.aruco, 'ArucoDetector'):
+            self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
+
         # Ported: Advanced detector parameters
         self.parameters.adaptiveThreshWinSizeMin = 5
         self.parameters.adaptiveThreshWinSizeMax = 21
@@ -314,7 +319,12 @@ class ZedArucoNode(Node):
             gray_frame = cv2.bilateralFilter(gray_frame, self.bilateral_d, self.bilateral_sigma_color, self.bilateral_sigma_space)
 
         all_corners, all_ids, seen_ids = [], [], set()
-        corners, ids, rejected = cv2.aruco.detectMarkers(gray_frame, self.dictionary, parameters=self.parameters)
+        
+        if self.detector:
+            corners, ids, rejected = self.detector.detectMarkers(gray_frame)
+        else:
+            corners, ids, rejected = cv2.aruco.detectMarkers(gray_frame, self.dictionary, parameters=self.parameters)
+
         if ids is not None:
             for i, mid in enumerate(ids.flatten()):
                 if mid not in seen_ids: all_corners.append(corners[i]); all_ids.append(mid); seen_ids.add(mid)
@@ -323,7 +333,12 @@ class ZedArucoNode(Node):
                 if meth == 'otsu': _, t = cv2.threshold(gray_frame, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 elif meth == 'fixed': _, t = cv2.threshold(gray_frame, self.fixed_threshold, 255, cv2.THRESH_BINARY)
                 else: continue
-                c, i, _ = cv2.aruco.detectMarkers(t, self.dictionary, parameters=self.parameters)
+                
+                if self.detector:
+                    c, i, _ = self.detector.detectMarkers(t)
+                else:
+                    c, i, _ = cv2.aruco.detectMarkers(t, self.dictionary, parameters=self.parameters)
+                
                 if i is not None:
                     for j, mid in enumerate(i.flatten()):
                         if mid not in seen_ids: all_corners.append(c[j]); all_ids.append(mid); seen_ids.add(mid)
