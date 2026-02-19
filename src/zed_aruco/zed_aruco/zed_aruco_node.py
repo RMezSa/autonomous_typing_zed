@@ -17,7 +17,7 @@ class ZedArucoNode(Node):
         self.declare_parameter('image_topic', '/zed2i/zed_node/rgb/color/rect/image')
         self.declare_parameter('marker_size', 0.1)  # meters
         self.declare_parameter('aruco_dictionary', 'DICT_4X4_50')
-        self.declare_parameter('target_key_label', 'Space')
+        self.declare_parameter('target_key_label', '')
         self.declare_parameter('homography_hold_seconds', 1.0)
         self.declare_parameter('use_clahe', True)
         self.declare_parameter('use_bilateral', True)
@@ -223,7 +223,17 @@ class ZedArucoNode(Node):
     def snap_keyboard_quad_to_roi(self, keyboard_quad, M, fresh_markers, corner_ids, w_dst, h_dst):
         if keyboard_quad is None or M is None or not fresh_markers or corner_ids is None:
             return keyboard_quad, [False]*4
-        centers_frame = np.array([np.mean(fresh_markers[mid][0], axis=0) for mid in corner_ids], dtype=np.float32).reshape(-1, 1, 2)
+        
+        # Use INSIDE corners for snapping (same logic as pts_src)
+        # TL Marker: Index 2 (BR) | TR Marker: Index 3 (BL) 
+        # BR Marker: Index 0 (TL) | BL Marker: Index 1 (TR)
+        centers_frame = np.array([
+            fresh_markers[corner_ids[0]][0][2],
+            fresh_markers[corner_ids[1]][0][3],
+            fresh_markers[corner_ids[2]][0][0],
+            fresh_markers[corner_ids[3]][0][1]
+        ], dtype=np.float32).reshape(-1, 1, 2)
+        
         centers_warp = cv2.perspectiveTransform(centers_frame, M).reshape(4, 2)
         roi_corners = np.array([[0, 0], [w_dst - 1, 0], [w_dst - 1, h_dst - 1], [0, h_dst - 1]], dtype=np.float32)
         adjusted = keyboard_quad.copy()
@@ -421,7 +431,11 @@ class ZedArucoNode(Node):
                     self.homography_stable_frames = 0
                     self.await_target_acquire = True
                     self.get_logger().info(f"Auto-typing next: '{self.current_typing_target}'")
-                else: self.autonomous_mode = False
+                else: 
+                    self.autonomous_mode = False
+                    self.target_key_label = ""
+                    self.current_typing_target = None
+                    self.get_logger().info("Autonomous typing completed. Returning to waiting state.")
 
         # 1. Tracking Mode (Fast Path)
         if self.key_track_active and self.prev_gray is not None and self.key_track_point is not None:
@@ -477,7 +491,17 @@ class ZedArucoNode(Node):
             sorted_y = sorted(centers.items(), key=lambda x: x[1][1])
             top, bot = sorted(sorted_y[:2], key=lambda x: x[1][0]), sorted(sorted_y[2:], key=lambda x: x[1][0])
             corner_ids = (top[0][0], top[1][0], bot[1][0], bot[0][0])
-            pts_src = np.array([fresh_markers[corner_ids[0]][0][0], fresh_markers[corner_ids[1]][0][1], fresh_markers[corner_ids[2]][0][2], fresh_markers[corner_ids[3]][0][3]], dtype="float32")
+            
+            # Using INSIDE corners (facing the keyboard) for standard ArUco orientation (0=TL)
+            # TL Marker: Index 2 (BR) | TR Marker: Index 3 (BL) 
+            # BR Marker: Index 0 (TL) | BL Marker: Index 1 (TR)
+            pts_src = np.array([
+                fresh_markers[corner_ids[0]][0][2], 
+                fresh_markers[corner_ids[1]][0][3], 
+                fresh_markers[corner_ids[2]][0][0], 
+                fresh_markers[corner_ids[3]][0][1]
+            ], dtype="float32")
+            
             w_dst, h_dst = 800, 400
             pts_dst = np.array([[0, 0], [w_dst-1, 0], [w_dst-1, h_dst-1], [0, h_dst-1]], dtype="float32")
             M, M_inv = cv2.getPerspectiveTransform(pts_src, pts_dst), cv2.getPerspectiveTransform(pts_dst, pts_src)
@@ -547,7 +571,7 @@ class ZedArucoNode(Node):
             cv2.imshow("Keyboard Layout (Canonical)", layout_img)
             cv2.imshow("Keyboard Layout (Warped)", warped_overlay)
             
-            if target_center_warp is not None:
+            if target_center_warp is not None and self.target_key_label:
                 target_real_final = cv2.perspectiveTransform(np.array([[[target_center_warp[0], target_center_warp[1]]]], dtype="float32"), active_M_inv)[0][0]
                 
                 # Reset acquisition once target is found in frame
