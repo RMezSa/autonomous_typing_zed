@@ -345,13 +345,29 @@ class ZedArucoNode(Node):
         return (tuple(all_corners), np.array(all_ids).reshape(-1, 1), rejected) if all_ids else (tuple(), None, rejected)
 
     def select_best_pose_ippe(self, corners, marker_size):
-        """PORTED: IPPE selection based on reprojection error"""
+        """PORTED: Pose estimation with support for both old and new OpenCV APIs"""
         if self.camera_matrix is None: return None, None
-        # IPPE returns two candidates. We pick the best one.
-        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, marker_size, self.camera_matrix, self.dist_coeffs)
-        # For simplicity in this ROS context, we return the first one as estimatePoseSingleMarkers 
-        # usually handles the primary candidate, but we keep the method hook for parity.
-        return rvecs, tvecs
+        
+        # Check if the old API is available
+        if hasattr(cv2.aruco, 'estimatePoseSingleMarkers'):
+            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, marker_size, self.camera_matrix, self.dist_coeffs)
+            return rvecs, tvecs
+        else:
+            # Fallback for OpenCV 4.7+ (using solvePnP)
+            obj_points = np.array([
+                [-marker_size/2, marker_size/2, 0],
+                [marker_size/2, marker_size/2, 0],
+                [marker_size/2, -marker_size/2, 0],
+                [-marker_size/2, -marker_size/2, 0]
+            ], dtype=np.float32)
+            
+            rvecs, tvecs = [], []
+            for marker_corners in corners:
+                _, rvec, tvec = cv2.solvePnP(obj_points, marker_corners, self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                # Reshape to match estimatePoseSingleMarkers output: (1, 3)
+                rvecs.append(rvec.reshape(1, 3))
+                tvecs.append(tvec.reshape(1, 3))
+            return np.array(rvecs), np.array(tvecs)
 
     def is_key_visible_warp(self, key_quad_warp, visible_poly_warp):
         if visible_poly_warp is None: return True
