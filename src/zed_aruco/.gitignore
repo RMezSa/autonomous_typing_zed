@@ -1,0 +1,11 @@
+# ROS 2 / Python ignore
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+build/
+install/
+log/
+.vscode/
+.DS_Store
+*.swp
