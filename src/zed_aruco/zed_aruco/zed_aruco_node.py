@@ -2,7 +2,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Pose, Point, Quaternion
+from geometry_msgs.msg import Pose, Point, Quaternion, PointStamped
+from std_msgs.msg import String, Bool, Float32
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -167,6 +168,12 @@ class ZedArucoNode(Node):
 
         self.marker_pub = self.create_publisher(MarkerArray, 'aruco_markers_3d', 10)
         self.debug_pub = self.create_publisher(Image, 'aruco_debug_image', 10)
+        self.target_key_pub = self.create_publisher(String, 'keyboard/target_key', 10)
+        self.target_point_pub = self.create_publisher(PointStamped, 'keyboard/target_point_px', 10)
+        self.target_valid_pub = self.create_publisher(Bool, 'keyboard/target_valid', 10)
+        self.target_confidence_pub = self.create_publisher(Float32, 'keyboard/target_confidence', 10)
+        self.state_pub = self.create_publisher(String, 'keyboard/state', 10)
+        self.done_sub = self.create_subscription(Bool, 'keyboard/mark_done', self.mark_done_callback, 10)
 
         self.get_logger().info(f"Zed ArUco Keyboard Node Migration Pass - Robustness & IPPE started.")
 
@@ -385,6 +392,14 @@ class ZedArucoNode(Node):
             self.current_typing_target = None
             self.await_target_acquire = True
 
+    def mark_done_callback(self, msg):
+        if not msg.data:
+            return
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        self.complete_current_key()
+        self.typing_cooldown_until = now_sec + self.typing_cooldown_duration
+        self.key_track_active = False
+
     def publish_rviz_markers(self, corners, ids, header):
         if self.camera_matrix is None or ids is None: return
         marker_array = MarkerArray()
@@ -444,6 +459,43 @@ class ZedArucoNode(Node):
             elif key in (8, 127): self.input_buffer = self.input_buffer[:-1]
             elif 32 <= key <= 126: self.input_buffer += chr(key)
 
+    def get_target_confidence(self):
+        if self.status_text == "TRACKING":
+            return 1.0
+        if self.status_text == "ARUCO":
+            return 0.9
+        if self.status_text == "FLOW":
+            return 0.7
+        if self.status_text == "HOLD":
+            return 0.5
+        return 0.0
+
+    def publish_integration_topics(self, header, target_xy):
+        state_msg = String()
+        state_msg.data = self.status_text
+        self.state_pub.publish(state_msg)
+
+        key_msg = String()
+        key_msg.data = self.target_key_label if self.target_key_label else ""
+        self.target_key_pub.publish(key_msg)
+
+        valid = target_xy is not None and bool(self.target_key_label)
+        valid_msg = Bool()
+        valid_msg.data = valid
+        self.target_valid_pub.publish(valid_msg)
+
+        confidence_msg = Float32()
+        confidence_msg.data = float(self.get_target_confidence() if valid else 0.0)
+        self.target_confidence_pub.publish(confidence_msg)
+
+        if valid:
+            point_msg = PointStamped()
+            point_msg.header = header
+            point_msg.point.x = float(target_xy[0])
+            point_msg.point.y = float(target_xy[1])
+            point_msg.point.z = 0.0
+            self.target_point_pub.publish(point_msg)
+
     def image_callback(self, msg):
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         try:
@@ -493,6 +545,7 @@ class ZedArucoNode(Node):
                 cv2.putText(cv_image, f"STATE: {self.status_text}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                 
                 self.handle_runtime_input(now_sec)
+                self.publish_integration_topics(msg.header, (filtered[0], filtered[1]))
                 self.publish_debug_image(cv_image, msg.header)
                 cv2.imshow("ArUco Detection", cv_image)
                 self.prev_gray = gray
@@ -643,6 +696,8 @@ class ZedArucoNode(Node):
         
         cv2.imshow("ArUco Detection", cv_image)
         self.handle_runtime_input(now_sec)
+        publish_target = (float(target_real_final[0]), float(target_real_final[1])) if target_real_final is not None else None
+        self.publish_integration_topics(msg.header, publish_target)
         self.publish_debug_image(cv_image, msg.header)
         self.prev_gray = gray
 

@@ -27,7 +27,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'zed_aruco_node = zed_aruco.zed_aruco_node:main'
+            'zed_aruco_node = zed_aruco.zed_aruco_node:main',
+            'typing_coordinator = zed_aruco.typing_coordinator:main'
         ],
     },
 )

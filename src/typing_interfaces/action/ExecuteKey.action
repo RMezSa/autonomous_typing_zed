@@ -1,0 +1,12 @@
+string key_label
+float64 x
+float64 y
+float64 z
+float64 roll
+float64 pitch
+---
+bool success
+string message
+---
+string stage
+float32 progress
