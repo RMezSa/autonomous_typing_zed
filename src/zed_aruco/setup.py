@@ -29,7 +29,9 @@ setup(
         'console_scripts': [
             'zed_aruco_node = zed_aruco.zed_aruco_node:main',
             'typing_coordinator = zed_aruco.typing_coordinator:main',
-            'calibration_probe = zed_aruco.calibration_probe:main'
+            'calibration_probe = zed_aruco.calibration_probe:main',
+            'fake_vision_publisher = zed_aruco.fake_vision_publisher:main',
+            'fake_execute_key_server = zed_aruco.fake_execute_key_server:main'
         ],
     },
 )

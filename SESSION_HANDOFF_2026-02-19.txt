@@ -1,0 +1,197 @@
+Autonomous Typing ZED - Session Handoff
+Date: 2026-02-19
+
+========================================
+1) WHAT WAS IMPLEMENTED
+========================================
+
+Phase 1 (Vision outputs for integration)
+- Added ROS integration topics in zed_aruco_node:
+  - /keyboard/target_key (std_msgs/String)
+  - /keyboard/target_point_px (geometry_msgs/PointStamped)
+  - /keyboard/target_valid (std_msgs/Bool)
+  - /keyboard/target_confidence (std_msgs/Float32)
+  - /keyboard/state (std_msgs/String)
+- Added confidence/state publishing logic.
+- Added std_msgs dependency in zed_aruco package.xml.
+
+Phase 2 (Action-based arm execution + autonomous done loop)
+- Added new interface package typing_interfaces:
+  - action/ExecuteKey.action
+- arm_ik:
+  - Added ExecuteKey action server at /arm_ik/execute_key
+  - Kept old /goal and /predefined paths working
+  - Added parameter publish_on_action (default false for safe dry-run)
+- zed_aruco:
+  - Added typing_coordinator action client node
+  - Added autonomous completion input to zed_aruco_node via /keyboard/mark_done
+  - Added launch file zed_typing_integration.launch.py
+
+Stability fix after testing
+- Fixed issue where dry-run action result was incorrectly advancing queue.
+- typing_coordinator now does NOT mark done on dry-run unless explicitly enabled.
+
+Phase 3 (TF-based targeting + safety clamps)
+- typing_coordinator now supports TF-based conversion from camera frame to arm base frame.
+- Added parameters for camera intrinsics and keyboard plane depth.
+- Added workspace safety bounds (x/y/z min/max) before sending goals.
+- Added fallback to old heuristic mapping when use_tf_targeting is false.
+
+Phase 4.1 (Calibration-safe bring-up)
+- Added motion safety gate to typing_coordinator:
+  - motion_enabled (default false)
+  - require_transform_valid (default true)
+  - publishes /keyboard/transform_valid
+- Added calibration_probe node:
+  - Publishes /keyboard/target_point_arm
+  - Computes error vs /keyboard/reference_point_arm
+  - Publishes /keyboard/calibration_error_m
+- Updated integration launch to support:
+  - Optional static TF publisher (tf2_ros static_transform_publisher)
+  - Optional calibration probe enable/disable
+
+========================================
+2) CURRENT SAFETY/BEHAVIOR STATUS
+========================================
+
+- By default, motion is protected at multiple levels:
+  1) arm_ik action path defaults to dry-run (publish_on_action=false)
+  2) typing_coordinator motion gate defaults to false (motion_enabled=false)
+  3) TF validity can be required before sending goals
+
+- Important: TF consumption is implemented, but real camera->arm calibration values still need tuning/validation.
+
+========================================
+3) KEY FILES CHANGED
+========================================
+
+- src/zed_aruco/zed_aruco/zed_aruco_node.py
+- src/zed_aruco/zed_aruco/typing_coordinator.py
+- src/zed_aruco/zed_aruco/calibration_probe.py
+- src/zed_aruco/launch/zed_typing_integration.launch.py
+- src/zed_aruco/setup.py
+- src/zed_aruco/package.xml
+- src/arm_ik/src/main.cpp
+- src/arm_ik/CMakeLists.txt
+- src/arm_ik/package.xml
+- src/typing_interfaces/action/ExecuteKey.action
+- src/typing_interfaces/CMakeLists.txt
+- src/typing_interfaces/package.xml
+
+========================================
+4) WHAT IS NEXT (RESUME PLAN)
+========================================
+
+Next phase: Calibration completion + controlled real motion test
+
+Step A: Calibration-safe run (no motion)
+- Launch integration with:
+  - motion_enabled=false
+  - enable_calibration_probe=true
+  - static_tf_enabled=true (initial rough values)
+- Verify these topics:
+  - /keyboard/transform_valid
+  - /keyboard/target_point_arm
+  - /keyboard/calibration_error_m
+
+Step B: 3-point calibration routine
+- Select 3 known keyboard points (for example: top-left, top-right, center).
+- For each point, publish measured arm-base reference to /keyboard/reference_point_arm.
+- Tune static TF and/or intrinsics/plane depth until calibration error is acceptable.
+
+Step C: Controlled motion enable
+- Start arm_ik with publish_on_action=true.
+- Keep min_confidence high and test a single key only.
+- Confirm no false done transitions and no out-of-workspace goals.
+
+Step D: Short sequence validation
+- Try 2-3 key sequence.
+- If stable, then try full word queue.
+
+========================================
+5) COMMANDS TO REMEMBER
+========================================
+
+Build selected packages:
+- colcon build --symlink-install --packages-select typing_interfaces arm_ik zed_aruco
+
+Run arm action server (real publish mode):
+- ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
+
+Run integration launch (example safe calibration mode):
+- ros2 launch zed_aruco zed_typing_integration.launch.py motion_enabled:=false enable_calibration_probe:=true static_tf_enabled:=true
+
+========================================
+6) GITHUB STATUS
+========================================
+
+- Changes were pushed previously to:
+  - https://github.com/RMezSa/autonomous_typing_zed.git
+  - branch: main
+  - commit: 7ab131a
+
+========================================
+7) UPDATE (2026-02-21)
+========================================
+
+New objective completed in this session:
+- Added continuous visual-servo workflow scaffold and implementation in typing_coordinator.
+- Added no-hardware simulation tooling and runtime command guide.
+- Added emergency stop hold behavior (no retract) for immediate safety pause.
+
+What was implemented:
+
+A) No-hardware integration assets
+- Added fake vision publisher node:
+  - src/zed_aruco/zed_aruco/fake_vision_publisher.py
+- Added fake ExecuteKey action server node:
+  - src/zed_aruco/zed_aruco/fake_execute_key_server.py
+- Added no-hardware launch:
+  - src/zed_aruco/launch/no_hardware_integration.launch.py
+
+B) Servo mode in typing_coordinator
+- Added parameterized servo mode switch:
+  - servo_mode_enabled (default false, keeps legacy behavior by default)
+- Added continuous ALIGN_XY logic:
+  - Pixel error -> incremental Cartesian /goal updates
+  - Rate limiting, gain params, per-step clamp
+  - Enter/exit threshold hysteresis + stable cycle requirement
+- Added PRESS_Z and RETRACT phases:
+  - Press with step increments until contact signal OR timeout OR max travel
+  - Retract back to saved hover Z
+  - Publish /keyboard/mark_done only on successful press-contact cycle
+
+C) Safety additions
+- Added emergency stop topic in typing_coordinator:
+  - /keyboard/emergency_stop (std_msgs/Bool)
+  - true -> immediate EMERGENCY_HOLD (no new commands, no retract)
+  - false -> release and re-arm from IDLE
+- Added press safety guards:
+  - servo_press_timeout_sec
+  - servo_press_max_travel_m
+  - workspace clamp checks on all servo updates
+
+D) Docs and runtime operations
+- Added runtime command cheat sheet:
+  - RUNTIME_COMMANDS.md
+- Updated package README with servo launch/tuning and emergency stop usage:
+  - src/zed_aruco/README.md
+
+E) Build/test status in this session
+- colcon build --symlink-install --packages-select zed_aruco : PASS
+- No-hardware launch smoke tests: node startup and command flow validated
+
+Current known behavior notes:
+- In servo mode, without physical contact button, press phase will timeout/max-travel and retry (no done).
+- With contact button integrated, successful press triggers done after retract.
+
+Next recommended actions:
+1) Wire real end-effector contact button publisher to /keyboard/contact_pressed.
+2) Run single-key real test with conservative parameters:
+   - low servo_xy gains
+   - low servo_press_step_m
+   - strict max travel + timeout
+3) Tune thresholds/hysteresis to avoid chatter (enter/exit px thresholds).
+4) Validate emergency hold path on real hardware before word-typing tests.
+
+End of handoff.

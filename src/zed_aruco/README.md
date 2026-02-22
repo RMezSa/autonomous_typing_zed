@@ -32,3 +32,30 @@ ros2 launch zed_aruco zed_aruco.launch.py image_topic:=/zed2i/zed_node/left/imag
 - `image_topic`: The topic to subscribe to for images.
 - `marker_size`: The real-world size of the ArUco marker (in meters).
 - `aruco_dictionary`: The dictionary to use (default: `DICT_4X4_50`).
+
+## No-hardware integration (servo mode)
+
+Use the integration launch to run fake vision + coordinator without arm hardware:
+
+```bash
+ros2 launch zed_aruco no_hardware_integration.launch.py servo_mode_enabled:=true motion_enabled:=true use_tf_targeting:=false text:=hola
+```
+
+Key servo parameters (in `typing_coordinator`):
+- `servo_mode_enabled`: enable/disable continuous XY servo path.
+- `servo_xy_step_max_m`: max XY increment per control update.
+- `servo_align_enter_thresh_px`: pixel threshold to consider aligned.
+- `servo_align_exit_thresh_px`: larger threshold to re-enter correction (hysteresis).
+- `servo_align_stable_cycles`: consecutive aligned cycles required before press.
+- `servo_press_step_m`: Z increment per press step.
+- `servo_press_max_travel_m`: max total Z travel during a press attempt.
+- `servo_press_timeout_sec`: timeout for contact detection.
+- `servo_retract_step_m`: Z increment per retract step.
+
+Contact input topic for press completion:
+- `keyboard/contact_pressed` (`std_msgs/Bool`)
+
+Emergency hold topic:
+- `keyboard/emergency_stop` (`std_msgs/Bool`)
+  - `true`: immediate hold (no new commands, no retract)
+  - `false`: release hold and re-arm from IDLE
