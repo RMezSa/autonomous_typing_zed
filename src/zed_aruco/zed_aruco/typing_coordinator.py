@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.time import Time
+import json
 
 from std_msgs.msg import String, Bool, Float32, Float64MultiArray
 from geometry_msgs.msg import PointStamped
@@ -57,7 +58,14 @@ class TypingCoordinator(Node):
         self.declare_parameter('servo_press_max_travel_m', 0.015)
         self.declare_parameter('servo_press_timeout_sec', 2.0)
         self.declare_parameter('servo_press_direction_sign', -1.0)
+        self.declare_parameter('servo_press_xy_scale', 0.6)
         self.declare_parameter('servo_retract_step_m', 0.0025)
+        self.declare_parameter('return_to_base_enabled', True)
+        self.declare_parameter('return_to_base_on_failure', True)
+        self.declare_parameter('return_to_base_command', 'KEYBOARD_HOME')
+        self.declare_parameter('return_to_base_wait_sec', 1.0)
+        self.declare_parameter('debug_status_topic', 'keyboard/coordinator_debug')
+        self.declare_parameter('debug_publish_period_sec', 0.25)
 
         self.declare_parameter('image_center_x', 640.0)
         self.declare_parameter('image_center_y', 360.0)
@@ -109,7 +117,14 @@ class TypingCoordinator(Node):
         self.servo_press_max_travel_m = float(self.get_parameter('servo_press_max_travel_m').value)
         self.servo_press_timeout_sec = float(self.get_parameter('servo_press_timeout_sec').value)
         self.servo_press_direction_sign = float(self.get_parameter('servo_press_direction_sign').value)
+        self.servo_press_xy_scale = float(self.get_parameter('servo_press_xy_scale').value)
         self.servo_retract_step_m = float(self.get_parameter('servo_retract_step_m').value)
+        self.return_to_base_enabled = bool(self.get_parameter('return_to_base_enabled').value)
+        self.return_to_base_on_failure = bool(self.get_parameter('return_to_base_on_failure').value)
+        self.return_to_base_command = str(self.get_parameter('return_to_base_command').value)
+        self.return_to_base_wait_sec = float(self.get_parameter('return_to_base_wait_sec').value)
+        self.debug_status_topic = str(self.get_parameter('debug_status_topic').value)
+        self.debug_publish_period_sec = float(self.get_parameter('debug_publish_period_sec').value)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -126,7 +141,9 @@ class TypingCoordinator(Node):
         self.done_pub = self.create_publisher(Bool, done_topic, 10)
         self.transform_valid_pub = self.create_publisher(Bool, 'keyboard/transform_valid', 10)
         self.goal_pub = self.create_publisher(Float64MultiArray, '/goal', 10)
+        self.predefined_pub = self.create_publisher(String, '/predefined', 10)
         self.servo_state_pub = self.create_publisher(String, self.servo_state_topic, 10)
+        self.debug_status_pub = self.create_publisher(String, self.debug_status_topic, 10)
 
         self.create_subscription(String, 'keyboard/target_key', self.on_target_key, 10)
         self.create_subscription(PointStamped, 'keyboard/target_point_px', self.on_target_point, 10)
@@ -163,9 +180,14 @@ class TypingCoordinator(Node):
         self.servo_press_start_z = 0.0
         self.servo_hover_z = 0.0
         self.servo_press_succeeded = False
+        self.servo_return_started = False
+        self.servo_return_start_time = 0.0
         self.current_goal_handle = None
+        self.last_goal_result = 'none'
+        self.last_goal_result_message = ''
 
         self.create_timer(0.1, self.tick)
+        self.create_timer(max(0.05, self.debug_publish_period_sec), self.publish_debug_status)
 
         self.get_logger().info(
             f"typing_coordinator started (motion_enabled={self.motion_enabled}, "
@@ -284,6 +306,39 @@ class TypingCoordinator(Node):
         msg.data = self.servo_phase
         self.servo_state_pub.publish(msg)
 
+    def publish_debug_status(self):
+        debug = {
+            'mode': 'servo' if self.servo_mode_enabled else 'action',
+            'motion_enabled': bool(self.motion_enabled),
+            'emergency_stop': bool(self.emergency_stop),
+            'servo_phase': self.servo_phase,
+            'goal_active': bool(self.goal_active),
+            'current_key': self.current_key,
+            'blocked_key': self.blocked_key,
+            'last_sent_key': self.last_sent_key,
+            'current_state': self.current_state,
+            'required_state': self.required_state,
+            'target_valid': bool(self.target_valid),
+            'target_confidence': float(self.target_confidence),
+            'transform_valid': bool(self.transform_valid),
+            'press_contact': bool(self.contact_pressed),
+            'servo_cmd': {
+                'x': float(self.servo_cmd_x),
+                'y': float(self.servo_cmd_y),
+                'z': float(self.servo_cmd_z),
+            },
+            'target_px': {
+                'x': float(self.current_point[0]) if self.current_point is not None else None,
+                'y': float(self.current_point[1]) if self.current_point is not None else None,
+            },
+            'last_goal_result': self.last_goal_result,
+            'last_goal_result_message': self.last_goal_result_message,
+        }
+
+        msg = String()
+        msg.data = json.dumps(debug, separators=(',', ':'))
+        self.debug_status_pub.publish(msg)
+
     def set_servo_phase(self, phase: str):
         if phase != self.servo_phase:
             self.get_logger().info(f"Servo phase: {self.servo_phase} -> {phase}")
@@ -303,6 +358,11 @@ class TypingCoordinator(Node):
             float(self.target_pitch),
         ]
         self.goal_pub.publish(goal_msg)
+
+    def command_return_to_base(self):
+        msg = String()
+        msg.data = self.return_to_base_command
+        self.predefined_pub.publish(msg)
 
     def initialize_servo_command_pose(self):
         if self.current_point is None:
@@ -335,6 +395,22 @@ class TypingCoordinator(Node):
         self.servo_press_succeeded = False
         return True
 
+    def compute_xy_servo_delta(self, px: float, py: float, scale: float = 1.0):
+        dx_px = self.image_center_x - px
+        dy_px = py - self.image_center_y
+
+        delta_x = self.clamp(
+            dy_px * self.servo_xy_gain_x * scale,
+            -self.servo_xy_step_max,
+            self.servo_xy_step_max,
+        )
+        delta_y = self.clamp(
+            dx_px * self.servo_xy_gain_y * scale,
+            -self.servo_xy_step_max,
+            self.servo_xy_step_max,
+        )
+        return delta_x, delta_y
+
     def start_press_phase(self, now_sec: float):
         self.servo_press_start_time = now_sec
         self.servo_press_start_z = self.servo_cmd_z
@@ -345,6 +421,18 @@ class TypingCoordinator(Node):
     def tick_press_phase(self, now_sec: float):
         if self.contact_pressed:
             self.servo_press_succeeded = True
+            self.set_servo_phase('RETRACTING')
+            return
+
+        if not self.target_valid or self.current_point is None:
+            self.get_logger().warn('Target lost during PRESSING_Z. Retracting.')
+            self.servo_press_succeeded = False
+            self.set_servo_phase('RETRACTING')
+            return
+
+        if self.target_confidence < self.min_confidence:
+            self.get_logger().warn('Confidence dropped during PRESSING_Z. Retracting.')
+            self.servo_press_succeeded = False
             self.set_servo_phase('RETRACTING')
             return
 
@@ -363,9 +451,12 @@ class TypingCoordinator(Node):
         if (now_sec - self.servo_last_cmd_time) < self.servo_cmd_cooldown_sec:
             return
 
+        px, py = self.current_point
+        delta_x, delta_y = self.compute_xy_servo_delta(px, py, self.servo_press_xy_scale)
+
+        next_x = self.servo_cmd_x + delta_x
+        next_y = self.servo_cmd_y + delta_y
         next_z = self.servo_cmd_z + (self.servo_press_direction_sign * self.servo_press_step_m)
-        next_x = self.servo_cmd_x
-        next_y = self.servo_cmd_y
 
         if not self.is_within_workspace(next_x, next_y, next_z):
             self.get_logger().warn('Press blocked by workspace bounds. Retracting.')
@@ -374,6 +465,8 @@ class TypingCoordinator(Node):
             return
 
         self.publish_cartesian_goal(next_x, next_y, next_z)
+        self.servo_cmd_x = next_x
+        self.servo_cmd_y = next_y
         self.servo_cmd_z = next_z
         self.servo_last_cmd_time = now_sec
 
@@ -408,6 +501,16 @@ class TypingCoordinator(Node):
         self.servo_cmd_initialized = False
         self.servo_cmd_key = ''
         self.servo_aligned_cycles = 0
+        self.servo_return_started = False
+        self.servo_return_start_time = 0.0
+
+        should_return_base = self.return_to_base_enabled and (
+            self.servo_press_succeeded or self.return_to_base_on_failure
+        )
+
+        if should_return_base:
+            self.set_servo_phase('RETURNING_BASE')
+            return
 
         if self.servo_press_succeeded:
             done_msg = Bool()
@@ -415,6 +518,28 @@ class TypingCoordinator(Node):
             self.done_pub.publish(done_msg)
             self.set_servo_phase('COMPLETE')
             self.get_logger().info(f"Servo typing completed for '{self.current_key}'")
+        else:
+            self.set_servo_phase('ALIGNING')
+
+    def tick_return_to_base_phase(self, now_sec: float):
+        if not self.servo_return_started:
+            self.command_return_to_base()
+            self.servo_return_start_time = now_sec
+            self.servo_return_started = True
+            return
+
+        if (now_sec - self.servo_return_start_time) < self.return_to_base_wait_sec:
+            return
+
+        self.servo_return_started = False
+        self.servo_return_start_time = 0.0
+
+        if self.servo_press_succeeded:
+            done_msg = Bool()
+            done_msg.data = True
+            self.done_pub.publish(done_msg)
+            self.set_servo_phase('COMPLETE')
+            self.get_logger().info(f"Servo typing completed for '{self.current_key}' after return-to-base")
         else:
             self.set_servo_phase('ALIGNING')
 
@@ -430,6 +555,14 @@ class TypingCoordinator(Node):
 
         if self.servo_phase == 'RETRACTING':
             self.tick_retract_phase(now_sec)
+            return
+
+        if self.servo_phase == 'RETURNING_BASE':
+            self.tick_return_to_base_phase(now_sec)
+            return
+
+        if self.servo_phase == 'COMPLETE':
+            self.set_servo_phase('WAIT_NEXT_KEY')
             return
 
         if self.goal_active:
@@ -484,8 +617,7 @@ class TypingCoordinator(Node):
             self.set_servo_phase('ALIGN_RATE_LIMIT')
             return
 
-        delta_x = self.clamp(dy_px * self.servo_xy_gain_x, -self.servo_xy_step_max, self.servo_xy_step_max)
-        delta_y = self.clamp(dx_px * self.servo_xy_gain_y, -self.servo_xy_step_max, self.servo_xy_step_max)
+        delta_x, delta_y = self.compute_xy_servo_delta(px, py)
 
         next_x = self.servo_cmd_x + delta_x
         next_y = self.servo_cmd_y + delta_y
@@ -588,6 +720,8 @@ class TypingCoordinator(Node):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.goal_active = False
+            self.last_goal_result = 'rejected'
+            self.last_goal_result_message = 'ExecuteKey goal rejected'
             self.get_logger().warn('ExecuteKey goal rejected')
             return
 
@@ -602,6 +736,8 @@ class TypingCoordinator(Node):
         result = future.result().result
 
         if self.emergency_stop:
+            self.last_goal_result = 'ignored_emergency_stop'
+            self.last_goal_result_message = result.message
             self.get_logger().warn('ExecuteKey result ignored because emergency stop is active.')
             return
 
@@ -611,6 +747,8 @@ class TypingCoordinator(Node):
         if result.success:
             if is_dry_run and not self.accept_dry_run_result:
                 self.blocked_key = self.last_sent_key
+                self.last_goal_result = 'dry_run_blocked'
+                self.last_goal_result_message = result.message
                 self.get_logger().warn(
                     f"ExecuteKey dry-run for '{self.last_sent_key}'. Not marking done. "
                     "Enable arm motion (publish_on_action:=true) or set accept_dry_run_result:=true."
@@ -621,8 +759,12 @@ class TypingCoordinator(Node):
             done_msg.data = True
             self.done_pub.publish(done_msg)
             self.blocked_key = ''
+            self.last_goal_result = 'success'
+            self.last_goal_result_message = result.message
             self.get_logger().info(f"ExecuteKey succeeded for '{self.last_sent_key}': {result.message}")
         else:
+            self.last_goal_result = 'failed'
+            self.last_goal_result_message = result.message
             self.get_logger().warn(f"ExecuteKey failed for '{self.last_sent_key}': {result.message}")
 
 

@@ -11,6 +11,9 @@
 #include <string>
 #include <thread>
 #include <memory>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
 
 class ArmNode : public rclcpp::Node {
     public:
@@ -23,6 +26,7 @@ class ArmNode : public rclcpp::Node {
             pub_q3_ = this->create_publisher<std_msgs::msg::Float64>("arm_teleop/joint3", 1);
             pub_q4_ = this->create_publisher<std_msgs::msg::Float64>("arm_teleop/joint4", 1);
             pub_q5_ = this->create_publisher<std_msgs::msg::Int32>("arm_teleop/joint5", 1);
+            debug_status_pub_ = this->create_publisher<std_msgs::msg::String>("/arm_ik/debug_status", 10);
 
             this->declare_parameter("publish_on_action", false);
             publish_on_action_ = this->get_parameter("publish_on_action").as_bool();
@@ -43,6 +47,11 @@ class ArmNode : public rclcpp::Node {
                 std::bind(&ArmNode::handleGoal, this, std::placeholders::_1, std::placeholders::_2),
                 std::bind(&ArmNode::handleCancel, this, std::placeholders::_1),
                 std::bind(&ArmNode::handleAccepted, this, std::placeholders::_1)
+            );
+
+            debug_timer_ = this->create_wall_timer(
+                std::chrono::milliseconds(250),
+                std::bind(&ArmNode::publishDebugStatus, this)
             );
 
             RCLCPP_INFO(this->get_logger(), "arm_node ready. Action publish_on_action=%s", publish_on_action_ ? "true" : "false");
@@ -130,7 +139,37 @@ class ArmNode : public rclcpp::Node {
             publishJoints(q1, q2, q3, q4, q5);
         }
 
+        last_ik_ok_ = true;
+        last_ik_message_ = publish_commands ? "ik_ok_published" : "ik_ok_dry_run";
+        last_command_time_sec_ = this->get_clock()->now().seconds();
         return true;
+    }
+
+    void publishDebugStatus() {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(3)
+           << "{"
+           << "\"publish_on_action\":" << (publish_on_action_ ? "true" : "false") << ","
+           << "\"last_command_source\":\"" << last_command_source_ << "\"," 
+           << "\"last_predefined\":\"" << last_predefined_ << "\"," 
+           << "\"last_action_key\":\"" << last_action_key_ << "\"," 
+           << "\"last_action_result\":\"" << last_action_result_ << "\"," 
+           << "\"last_ik_ok\":" << (last_ik_ok_ ? "true" : "false") << ","
+           << "\"last_ik_message\":\"" << last_ik_message_ << "\"," 
+           << "\"last_command_time_sec\":" << last_command_time_sec_ << ","
+           << "\"goal_xyz\":{" 
+           << "\"x\":" << gx_ << ","
+           << "\"y\":" << gy_ << ","
+           << "\"z\":" << gz_ << "},"
+           << "\"goal_rp\":{" 
+           << "\"roll\":" << groll_ << ","
+           << "\"pitch\":" << gpitch_ << "},"
+           << "\"keyboard_home_set\":" << (kb_home_set_ ? "true" : "false")
+           << "}";
+
+        std_msgs::msg::String msg;
+        msg.data = os.str();
+        debug_status_pub_->publish(msg);
     }
 
     double gx_ = 0.15;
@@ -138,6 +177,13 @@ class ArmNode : public rclcpp::Node {
     double gz_ = 0.35;
     double groll_ = 0.0;
     double gpitch_ = 0.0;
+
+    bool kb_home_set_ = false;
+    double kb_home_x_ = 0.15;
+    double kb_home_y_ = 0.0;
+    double kb_home_z_ = 0.35;
+    double kb_home_roll_ = 0.0;
+    double kb_home_pitch_ = 0.0;
 
     static inline bool isNan(double v) {
         return std::isnan(v);
@@ -158,15 +204,50 @@ class ArmNode : public rclcpp::Node {
         if (!isNan(roll)) groll_ = roll;
         if (!isNan(pitch)) gpitch_ = pitch;
 
-        (void)runIKAndPublish(gx_, gy_, gz_, groll_, gpitch_, true);
+        last_command_source_ = "topic:/goal";
+        const bool ok = runIKAndPublish(gx_, gy_, gz_, groll_, gpitch_, true);
+        if (!ok) {
+            last_ik_ok_ = false;
+            last_ik_message_ = "ik_failed_topic_goal";
+            RCLCPP_WARN(this->get_logger(), "IK failed for /goal target xyz=(%.3f, %.3f, %.3f)", gx_, gy_, gz_);
+        }
     }
 
     void onPredefined(const std_msgs::msg::String::SharedPtr msg) {
         const std::string &p = msg->data;
 
+        if (p == "SET_KEYBOARD_HOME" || p == "SET_KB_HOME") {
+            kb_home_x_ = gx_;
+            kb_home_y_ = gy_;
+            kb_home_z_ = gz_;
+            kb_home_roll_ = groll_;
+            kb_home_pitch_ = gpitch_;
+            kb_home_set_ = true;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Keyboard home captured at xyz=(%.3f, %.3f, %.3f), roll=%.3f, pitch=%.3f",
+                kb_home_x_, kb_home_y_, kb_home_z_, kb_home_roll_, kb_home_pitch_
+            );
+            last_predefined_ = p;
+            last_command_source_ = "topic:/predefined";
+            last_ik_ok_ = true;
+            last_ik_message_ = "keyboard_home_captured";
+            last_command_time_sec_ = this->get_clock()->now().seconds();
+            return;
+        }
+
         if (p == "HOME") {
             gx_ = 0.15; gy_ = 0.0; gz_ = 0.35;
             groll_ = 0.0; gpitch_ = 0.0;
+        } else if (p == "KEYBOARD_HOME" || p == "KB_HOME") {
+            if (!kb_home_set_) {
+                RCLCPP_WARN(this->get_logger(), "Keyboard home not set yet. Send SET_KEYBOARD_HOME first.");
+                return;
+            }
+
+            gx_ = kb_home_x_; gy_ = kb_home_y_; gz_ = kb_home_z_;
+            groll_ = kb_home_roll_; gpitch_ = kb_home_pitch_;
         } else if (p == "INTERMEDIATE") {
             gx_ = 0.20; gy_ = 0.0; gz_ = 0.60;
             groll_ = 0.0; gpitch_ = 0.0;
@@ -183,12 +264,21 @@ class ArmNode : public rclcpp::Node {
             return;
         }
 
-        (void)runIKAndPublish(gx_, gy_, gz_, groll_, gpitch_, true);
+        last_predefined_ = p;
+        last_command_source_ = "topic:/predefined";
+        const bool ok = runIKAndPublish(gx_, gy_, gz_, groll_, gpitch_, true);
+        if (!ok) {
+            last_ik_ok_ = false;
+            last_ik_message_ = "ik_failed_predefined";
+            RCLCPP_WARN(this->get_logger(), "IK failed for predefined '%s'", p.c_str());
+        }
     }
 
     rclcpp_action::GoalResponse handleGoal(
         const rclcpp_action::GoalUUID &, std::shared_ptr<const ExecuteKey::Goal> goal) {
         RCLCPP_INFO(this->get_logger(), "ExecuteKey received for '%s'", goal->key_label.c_str());
+        last_action_key_ = goal->key_label;
+        last_action_result_ = "accepted";
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     }
 
@@ -206,6 +296,9 @@ class ArmNode : public rclcpp::Node {
         auto feedback = std::make_shared<ExecuteKey::Feedback>();
         auto result = std::make_shared<ExecuteKey::Result>();
 
+        last_command_source_ = "action:/arm_ik/execute_key";
+        last_action_key_ = goal->key_label;
+
         feedback->stage = "ik";
         feedback->progress = 0.5f;
         goal_handle->publish_feedback(feedback);
@@ -215,6 +308,7 @@ class ArmNode : public rclcpp::Node {
         if (goal_handle->is_canceling()) {
             result->success = false;
             result->message = "Cancelled";
+            last_action_result_ = "cancelled";
             goal_handle->canceled(result);
             return;
         }
@@ -226,10 +320,14 @@ class ArmNode : public rclcpp::Node {
         if (ok) {
             result->success = true;
             result->message = publish_on_action_ ? "IK solved and command published" : "IK solved (dry-run, no publish)";
+            last_action_result_ = result->message;
             goal_handle->succeed(result);
         } else {
             result->success = false;
             result->message = "IK failed for requested goal";
+            last_ik_ok_ = false;
+            last_ik_message_ = "ik_failed_action_goal";
+            last_action_result_ = result->message;
             goal_handle->abort(result);
         }
     }
@@ -239,11 +337,20 @@ class ArmNode : public rclcpp::Node {
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_q3_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_q4_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr pub_q5_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr debug_status_pub_;
 
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_goal_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_predefined_;
     rclcpp_action::Server<ExecuteKey>::SharedPtr action_server_;
+    rclcpp::TimerBase::SharedPtr debug_timer_;
     bool publish_on_action_{false};
+    std::string last_command_source_{"startup"};
+    std::string last_predefined_{"none"};
+    std::string last_action_key_{""};
+    std::string last_action_result_{"none"};
+    bool last_ik_ok_{false};
+    std::string last_ik_message_{"none"};
+    double last_command_time_sec_{0.0};
     
 };
 
