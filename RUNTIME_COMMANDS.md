@@ -1,5 +1,119 @@
 # Runtime Commands Cheat Sheet
 
+---
+
+## ⚡ URC FULL WORKFLOW — de cero a brazo moviéndose
+
+### PASO 1 — Build (solo la primera vez en esta máquina o si hubo cambios de código)
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+
+# Si el build falla con "existing path cannot be removed: Is a directory":
+rm -rf build/typing_interfaces
+
+# Build de los 3 paquetes del sistema
+colcon build --symlink-install --packages-select typing_interfaces arm_ik zed_aruco
+
+source install/setup.bash
+```
+
+> **¿Por qué el rm -rf?** Si alguna vez se corrió `colcon build` sin `--symlink-install`,
+> queda un directorio basura en `build/typing_interfaces/` que bloquea futuros builds.
+> Borrarlo lo resuelve completamente.
+
+---
+
+### PASO 2 — Abre 3 terminales y sourcea en cada una
+
+```bash
+# En cada terminal nueva:
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+```
+
+---
+
+### PASO 3 — Terminal A: lanza el brazo
+
+```bash
+ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
+```
+
+Debes ver: `arm_node ready. Action publish_on_action=true`
+
+---
+
+### PASO 4 — Terminal B: lanza cámara + coordinador
+
+```bash
+ros2 launch zed_aruco zed_typing_integration.launch.py
+```
+
+Sin argumentos. Los defaults ya están configurados para URC:
+- `servo_mode_enabled=true` → lazo cerrado
+- `use_tf_targeting=false` → sin TF, sin mediciones físicas
+- `require_transform_valid=false` → no depende de TF
+- `motion_enabled=false` → seguro, el brazo no se mueve aún
+
+Espera a ver `TRACKING` en la ventana de OpenCV (la cámara detecta el teclado).
+
+---
+
+### PASO 5 — Terminal C: calibración de posición base (una vez por sesión)
+
+```bash
+# Mueve el brazo manualmente cerca del centro del teclado
+# Ajusta estos valores hasta que el brazo quede sobre el área central del teclado:
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.0, 0.15, 0.0, -75.0]}" --once
+
+# Lee la posición actual del brazo
+ros2 topic echo /arm_ik/debug_status --once
+# Busca: "goal_xyz":{"x":0.30,"y":0.0,...}
+
+# Setea esos valores en el coordinador
+ros2 param set /typing_coordinator base_x 0.30   # ← el x que leíste
+ros2 param set /typing_coordinator base_y 0.0    # ← el y que leíste
+```
+
+---
+
+### PASO 6 — Habilita movimiento
+
+```bash
+ros2 param set /typing_coordinator motion_enabled true
+```
+
+El brazo ahora responde a las teclas detectadas por la cámara.
+
+---
+
+### PASO 7 — Simula el contact durante cada keypress (sin limit switch físico)
+
+```bash
+# Cuando veas que el brazo llegó a la tecla → activa contact:
+ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: true}" --once
+
+# El coordinador retrae automáticamente y pasa a la siguiente tecla.
+# Si quieres limpiar el contact manualmente:
+ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: false}" --once
+```
+
+---
+
+### Por qué no hay errores anteriores
+
+| Error anterior | Causa | Solución aplicada |
+|---|---|---|
+| `arm_base TF does not exist` | TF habilitado por defecto, sin bridge | Default cambiado a `use_tf_targeting=false` |
+| `ExecuteKey action server not available` | arm_node no estaba corriendo | Se lanza explícito en Terminal A antes del launch |
+| `typing_interfaces build failed` | Build cache corrupto | `rm -rf build/typing_interfaces` antes del colcon |
+| `zed_aruco not found` | Cascada del error de build anterior | Resuelto al arreglar el build |
+
+---
+
 ## 0) Environment
 
 ```bash
@@ -35,18 +149,52 @@ source install/setup.bash
 ```bash
 ros2 launch zed_aruco zed_typing_integration.launch.py \
   motion_enabled:=false \
-  enable_calibration_probe:=true \
-  static_tf_enabled:=true
+  use_tf_targeting:=false \
+  require_transform_valid:=false \
+  enable_calibration_probe:=false
 ```
 
-### Real execution bring-up (motion enabled)
+### Real execution bring-up — competition mode (no TF, recommended)
+
+> **This is the intended URC approach.** No camera-to-arm measurement needed.
+> Set `base_x/base_y` = arm position when hovering over the key at the image center (see section 8 for calibration workflow).
+> Tune `scale_x_per_px` and `scale_y_per_px` empirically until off-center keys land correctly.
+
+```bash
+ros2 launch zed_aruco zed_typing_integration.launch.py \
+  motion_enabled:=true \
+  use_tf_targeting:=false \
+  require_transform_valid:=false \
+  min_confidence:=0.2
+```
+
+Then at runtime set calibrated values:
+
+```bash
+ros2 param set /typing_coordinator base_x <arm_x_at_image_center>
+ros2 param set /typing_coordinator base_y <arm_y_at_image_center>
+ros2 param set /typing_coordinator scale_x_per_px 0.00035
+ros2 param set /typing_coordinator scale_y_per_px 0.00035
+```
+
+### Real execution bring-up — TF mode (optional, requires physical calibration)
+
+> Only use this if you have pre-measured the camera-to-arm transform.
+> See section 8 for the full TF calibration workflow.
 
 ```bash
 ros2 launch zed_aruco zed_typing_integration.launch.py \
   motion_enabled:=true \
   use_tf_targeting:=true \
   require_transform_valid:=true \
-  min_confidence:=0.2
+  min_confidence:=0.2 \
+  static_tf_enabled:=true \
+  static_tf_x:=<measured_x_m> \
+  static_tf_y:=<measured_y_m> \
+  static_tf_z:=<measured_z_m> \
+  static_tf_roll:=-1.5708 \
+  static_tf_pitch:=<camera_tilt_rad> \
+  static_tf_yaw:=-1.5708
 ```
 
 ### Run arm action server in real publish mode
@@ -245,6 +393,104 @@ ros2 topic echo /keyboard/reference_point_arm
 ros2 topic echo /keyboard/calibration_error_m
 ```
 
+### Competition calibration workflow (no-TF mode, `use_tf_targeting:=false`)
+
+This approach requires no tape measure or TF math. You calibrate by driving the arm to two reference positions.
+
+**What the parameters mean:**
+- `base_x/base_y`: arm XY position (in arm_base frame) when the arm is hovering over the key that sits at the **image center**
+- `scale_x_per_px`: how many meters the arm moves in X per pixel of vertical image offset (default 0.00035)
+- `scale_y_per_px`: how many meters the arm moves in Y per pixel of horizontal image offset (default 0.00035)
+
+**Step 1 – Find base_x and base_y**
+
+```bash
+# Arm node must be running
+ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
+
+# Drive arm manually to hover over the key at the image center
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [x, y, z, roll, pitch]}" --once
+
+# Read current arm target xyz from debug
+ros2 topic echo /arm_ik/debug_status
+# Note the x and y values → these become base_x and base_y
+```
+
+**Step 2 – Set calibration values at runtime**
+
+```bash
+ros2 param set /typing_coordinator base_x <value_from_step1_x>
+ros2 param set /typing_coordinator base_y <value_from_step1_y>
+```
+
+**Step 3 – Verify and tune scale factors**
+
+1. Enable motion: `ros2 param set /typing_coordinator motion_enabled true`
+2. Command a key that is far from image center (e.g. a corner key)
+3. Observe where the arm lands vs where the key actually is
+4. If overshooting: decrease scale. If undershooting: increase scale:
+```bash
+ros2 param set /typing_coordinator scale_x_per_px 0.00030
+ros2 param set /typing_coordinator scale_y_per_px 0.00030
+```
+5. Repeat until the arm lands on the correct key consistently
+
+**Step 4 – Save confirmed values**
+
+Record the confirmed `base_x`, `base_y`, `scale_x_per_px`, `scale_y_per_px` values here for the next session.
+
+```
+# Confirmed calibration values (fill in after calibration):
+# base_x        = 
+# base_y        = 
+# scale_x_per_px = 
+# scale_y_per_px = 
+```
+
+---
+
+### TF calibration workflow (optional — only if NOT using competition mode)
+
+Only required if using `use_tf_targeting:=true`. Requires knowing the physical camera-to-arm transform.
+
+**Step 1 – Orientation starting values**
+
+For a camera mounted level and pointing forward (optical convention offset):
+```
+static_tf_roll  := -1.5708   # -π/2, always required for optical frame
+static_tf_pitch := 0.0       # add downward tilt angle in radians if camera is angled
+static_tf_yaw   := -1.5708   # -π/2, always required for optical frame
+```
+
+**Step 2 – Iterative refinement using calibration_probe**
+
+```bash
+# Terminal A – arm node
+ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
+
+# Terminal B – stack with TF mode
+ros2 launch zed_aruco zed_typing_integration.launch.py \
+  motion_enabled:=false \
+  use_tf_targeting:=true \
+  enable_calibration_probe:=true \
+  static_tf_enabled:=true \
+  static_tf_x:=<estimate_m> \
+  static_tf_y:=<estimate_m> \
+  static_tf_z:=<estimate_m> \
+  static_tf_roll:=-1.5708 \
+  static_tf_pitch:=0.0 \
+  static_tf_yaw:=-1.5708
+
+# Terminal C – watch error live (target: < 0.01 m)
+ros2 topic echo /keyboard/calibration_error_m
+
+# Terminal D – publish arm reference (arm tip current position)
+ros2 topic pub /keyboard/reference_point_arm geometry_msgs/msg/PointStamped \
+  "{header: {frame_id: 'arm_base'}, point: {x: 0.30, y: 0.05, z: 0.10}}" --once
+```
+
+Adjust `static_tf_x/y/z` until error < 0.01 m across 3+ different arm positions.
+
 ---
 
 ## 9) Clean restart sequence
@@ -279,7 +525,7 @@ source install/setup.bash
 ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
 ```
 
-#### Terminal B: vision + coordinator (safe first)
+#### Terminal B: vision + coordinator (safe first, competition/no-TF mode)
 
 ```bash
 cd /home/roberd/ros2_ws
@@ -287,8 +533,8 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch zed_aruco zed_typing_integration.launch.py \
   motion_enabled:=false \
-  enable_calibration_probe:=true \
-  static_tf_enabled:=true
+  use_tf_targeting:=false \
+  require_transform_valid:=false
 ```
 
 #### Terminal C: live debug watchers
@@ -337,6 +583,11 @@ ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: false}" --once
   - `ros2 param get /typing_coordinator motion_enabled` must be `true`.
   - arm node must run with `publish_on_action:=true`.
   - check `/keyboard/coordinator_debug` for gate state (`WAIT_TARGET`, `WAIT_STATE`, etc.).
+  - if using `use_tf_targeting:=false`, confirm `base_x/base_y` are set to the arm's actual center-key position (not 0.0):
+    ```bash
+    ros2 param get /typing_coordinator base_x
+    ros2 param get /typing_coordinator base_y
+    ```
 
 - Stuck in `WAIT_CONFIDENCE`:
   - lower threshold temporarily:

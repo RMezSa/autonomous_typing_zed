@@ -58,18 +58,18 @@ class ZedArucoNode(Node):
         self.parameters.adaptiveThreshWinSizeMax = 21
         self.parameters.adaptiveThreshWinSizeStep = 4
         self.parameters.adaptiveThreshConstant = 5
-        self.parameters.minMarkerPerimeterRate = 0.01
+        self.parameters.minMarkerPerimeterRate = 0.03
         self.parameters.maxMarkerPerimeterRate = 4.0
         self.parameters.polygonalApproxAccuracyRate = 0.03
         self.parameters.minCornerDistanceRate = 0.03
-        self.parameters.minMarkerDistanceRate = 0.01
-        self.parameters.minDistanceToBorder = 1
+        self.parameters.minMarkerDistanceRate = 0.05
+        self.parameters.minDistanceToBorder = 3
         self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.parameters.cornerRefinementWinSize = 5
         self.parameters.cornerRefinementMaxIterations = 60
         self.parameters.cornerRefinementMinAccuracy = 0.01
         
-        self.use_multi_threshold = True
+        self.use_multi_threshold = False
         self.threshold_methods = ['adaptive', 'otsu', 'fixed']
         self.fixed_threshold = 100
 
