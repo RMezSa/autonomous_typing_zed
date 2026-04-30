@@ -1,0 +1,60 @@
+# ROS 2 / colcon
+build/
+install/
+log/
+.ros/
+colcon_logs/
+
+# ROS bag / data
+rosbag2_*/
+*.db3
+*.db3-wal
+*.db3-shm
+*.mcap
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+.eggs/
+dist/
+python_build/
+
+# ZED camera recordings
+*.svo
+*.svo2
+*.avi
+*.mp4
+*.mkv
+
+# Vision models / weights
+*.weights
+*.engine
+*.onnx
+*.pt
+*.pth
+*.tflite
+*.trt
+*.plan
+*.pb
+
+# Editor / OS temp
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.history/
