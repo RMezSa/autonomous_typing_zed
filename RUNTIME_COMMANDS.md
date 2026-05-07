@@ -263,12 +263,12 @@ ros2 param set /typing_coordinator min_confidence 0.2         # min target confi
 ros2 param set /typing_coordinator required_state TRACKING     # required vision state label before moving
 ```
 
-### Servo XY tuning
+### Servo YZ tuning (vertical panel)
 
 ```bash
-ros2 param set /typing_coordinator servo_xy_gain_x_m_per_px 0.00035   # X correction gain [meters per pixel] from image error
-ros2 param set /typing_coordinator servo_xy_gain_y_m_per_px 0.00035   # Y correction gain [meters per pixel] from image error
-ros2 param set /typing_coordinator servo_xy_step_max_m 0.003           # max XY correction per control update [m] (3 mm)
+ros2 param set /typing_coordinator servo_y_gain_m_per_px 0.00035       # horizontal pixel error → arm-y gain [m/px]
+ros2 param set /typing_coordinator servo_z_gain_m_per_px 0.00035       # vertical pixel error → arm-z gain [m/px]
+ros2 param set /typing_coordinator servo_xy_step_max_m 0.003           # max YZ correction per control update [m] (3 mm)
 ros2 param set /typing_coordinator servo_align_enter_thresh_px 8.0     # "aligned" threshold [px] to enter stable-aligned logic
 ros2 param set /typing_coordinator servo_align_exit_thresh_px 12.0     # drift threshold [px] to leave aligned band (hysteresis)
 ros2 param set /typing_coordinator servo_align_stable_cycles 4          # consecutive in-threshold cycles needed before press
@@ -602,17 +602,17 @@ ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: false}" --once
     ```
 
 - Press goes wrong way (away from key):
-  - flip sign:
+  - flip sign (vertical-panel default is `+1.0` = press into panel):
     ```bash
-    ros2 param set /typing_coordinator servo_press_direction_sign 1.0
+    ros2 param set /typing_coordinator servo_press_direction_sign -1.0
     ```
-  - if that is worse, set it back to `-1.0`.
+  - if that is worse, set it back to `1.0`.
 
-- Oscillation/jitter in XY align:
+- Oscillation/jitter in YZ align:
   - reduce gains / step:
     ```bash
-    ros2 param set /typing_coordinator servo_xy_gain_x_m_per_px 0.00025
-    ros2 param set /typing_coordinator servo_xy_gain_y_m_per_px 0.00025
+    ros2 param set /typing_coordinator servo_y_gain_m_per_px 0.00025
+    ros2 param set /typing_coordinator servo_z_gain_m_per_px 0.00025
     ros2 param set /typing_coordinator servo_xy_step_max_m 0.002
     ```
 

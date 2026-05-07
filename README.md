@@ -105,23 +105,27 @@ graph LR
 | typing_coordinator.workspace_* | x:[-0.10,0.55], y:[-0.55,0.55], z:[0.02,0.80] | Workspace bounds. |
 | typing_coordinator.motion_enabled | false | Safety gate for motion. |
 | typing_coordinator.require_transform_valid | true | Require valid TF before moving. |
-| typing_coordinator.servo_mode_enabled | false | Enable continuous XY servo + press/retract. |
+| typing_coordinator.servo_mode_enabled | false | Enable continuous YZ servo + press/retract (vertical panel). |
 | typing_coordinator.contact_topic | keyboard/contact_pressed | Contact input. |
 | typing_coordinator.emergency_stop_topic | keyboard/emergency_stop | Immediate hold (no retract). |
-| typing_coordinator.servo_xy_gain_x/y_m_per_px | 0.00035 | XY servo gain. |
-| typing_coordinator.servo_xy_step_max_m | 0.003 | Max XY step per update. |
+| typing_coordinator.servo_y_gain_m_per_px | 0.00035 | Horizontal pixel error → arm-y gain. |
+| typing_coordinator.servo_z_gain_m_per_px | 0.00035 | Vertical pixel error → arm-z gain. |
+| typing_coordinator.servo_xy_step_max_m | 0.003 | Max YZ step per update. |
 | typing_coordinator.servo_align_enter/exit_thresh_px | 8.0 / 12.0 | Alignment hysteresis. |
 | typing_coordinator.servo_align_stable_cycles | 4 | Stable cycles before press. |
 | typing_coordinator.servo_cmd_cooldown_sec | 0.08 | Servo command cooldown. |
-| typing_coordinator.servo_press_step_m | 0.0015 | Press Z step. |
-| typing_coordinator.servo_press_max_travel_m | 0.015 | Max press travel. |
+| typing_coordinator.servo_press_step_m | 0.0015 | Press step along arm-x (into panel). |
+| typing_coordinator.servo_press_max_travel_m | 0.015 | Max press travel along arm-x. |
 | typing_coordinator.servo_press_timeout_sec | 2.0 | Press timeout. |
-| typing_coordinator.servo_retract_step_m | 0.0025 | Retract Z step. |
+| typing_coordinator.servo_press_direction_sign | +1.0 | +1.0 presses into panel (+arm-x). |
+| typing_coordinator.servo_retract_step_m | 0.0025 | Retract step along arm-x back to hover. |
 | typing_coordinator.return_to_base_* | enabled=true, on_failure=true, command=KEYBOARD_HOME | Return-to-base behavior. |
 | typing_coordinator.debug_publish_period_sec | 0.25 | Debug publish period (s). |
 | typing_coordinator.image_center_x/y | 640.0 / 360.0 | Image center for heuristic mapping. |
-| typing_coordinator.base_x/base_y | 0.25 / 0.0 | Base offset for heuristic mapping. |
-| typing_coordinator.scale_x/y_per_px | 0.00035 | px->m scale for heuristic mapping. |
+| typing_coordinator.base_x/base_y | 0.25 / 0.0 | Vertical-panel mapping: base_x = panel-face arm-x; base_y = arm-y at horizontal center. |
+| typing_coordinator.target_z | 0.12 | Vertical-panel mapping: arm-z at the keyboard top reference pixel. |
+| typing_coordinator.scale_y_per_px | 0.00035 | Horizontal px → arm-y scale. |
+| typing_coordinator.scale_z_per_px | 0.00035 | Vertical px → arm-z scale. |
 | calibration_probe.arm_base_frame | arm_base | Arm base frame for TF. |
 | calibration_probe.camera_frame | "" | Camera frame; if empty, uses msg frame_id. |
 | calibration_probe.keyboard_plane_z_m | 0.45 | Keyboard plane depth (m). |

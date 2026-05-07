@@ -47,8 +47,8 @@ class TypingCoordinator(Node):
         self.declare_parameter('contact_topic', 'keyboard/contact_pressed')
         self.declare_parameter('servo_state_topic', 'keyboard/servo_state')
         self.declare_parameter('emergency_stop_topic', 'keyboard/emergency_stop')
-        self.declare_parameter('servo_xy_gain_x_m_per_px', 0.00035)
-        self.declare_parameter('servo_xy_gain_y_m_per_px', 0.00035)
+        self.declare_parameter('servo_z_gain_m_per_px', 0.00035)
+        self.declare_parameter('servo_y_gain_m_per_px', 0.00035)
         self.declare_parameter('servo_xy_step_max_m', 0.003)
         self.declare_parameter('servo_align_enter_thresh_px', 8.0)
         self.declare_parameter('servo_align_exit_thresh_px', 12.0)
@@ -57,7 +57,7 @@ class TypingCoordinator(Node):
         self.declare_parameter('servo_press_step_m', 0.0015)
         self.declare_parameter('servo_press_max_travel_m', 0.015)
         self.declare_parameter('servo_press_timeout_sec', 2.0)
-        self.declare_parameter('servo_press_direction_sign', -1.0)
+        self.declare_parameter('servo_press_direction_sign', 1.0)
         self.declare_parameter('servo_press_xy_scale', 0.6)
         self.declare_parameter('servo_retract_step_m', 0.0025)
         self.declare_parameter('return_to_base_enabled', True)
@@ -106,8 +106,8 @@ class TypingCoordinator(Node):
         self.contact_topic = str(self.get_parameter('contact_topic').value)
         self.servo_state_topic = str(self.get_parameter('servo_state_topic').value)
         self.emergency_stop_topic = str(self.get_parameter('emergency_stop_topic').value)
-        self.servo_xy_gain_x = float(self.get_parameter('servo_xy_gain_x_m_per_px').value)
-        self.servo_xy_gain_y = float(self.get_parameter('servo_xy_gain_y_m_per_px').value)
+        self.servo_z_gain = float(self.get_parameter('servo_z_gain_m_per_px').value)
+        self.servo_y_gain = float(self.get_parameter('servo_y_gain_m_per_px').value)
         self.servo_xy_step_max = float(self.get_parameter('servo_xy_step_max_m').value)
         self.servo_align_enter_thresh_px = float(self.get_parameter('servo_align_enter_thresh_px').value)
         self.servo_align_exit_thresh_px = float(self.get_parameter('servo_align_exit_thresh_px').value)
@@ -177,8 +177,8 @@ class TypingCoordinator(Node):
         self.servo_last_cmd_time = 0.0
         self.servo_cmd_key = ''
         self.servo_press_start_time = 0.0
-        self.servo_press_start_z = 0.0
-        self.servo_hover_z = 0.0
+        self.servo_press_start_x = 0.0
+        self.servo_hover_x = 0.0
         self.servo_press_succeeded = False
         self.servo_return_started = False
         self.servo_return_start_time = 0.0
@@ -394,32 +394,32 @@ class TypingCoordinator(Node):
         self.servo_cmd_key = self.current_key
         self.servo_aligned_cycles = 0
         self.servo_last_cmd_time = 0.0
-        self.servo_hover_z = self.servo_cmd_z
+        self.servo_hover_x = self.servo_cmd_x
         self.servo_press_succeeded = False
         return True
 
-    def compute_xy_servo_delta(self, px: float, py: float, scale: float = 1.0):
+    def compute_yz_servo_delta(self, px: float, py: float, scale: float = 1.0):
         dx_px = self.image_center_x - px
-        dy_px = py - self.image_center_y
+        dy_px = self.image_center_y - py
 
-        delta_x = self.clamp(
-            dy_px * self.servo_xy_gain_x * scale,
-            -self.servo_xy_step_max,
-            self.servo_xy_step_max,
-        )
         delta_y = self.clamp(
-            dx_px * self.servo_xy_gain_y * scale,
+            dx_px * self.servo_y_gain * scale,
             -self.servo_xy_step_max,
             self.servo_xy_step_max,
         )
-        return delta_x, delta_y
+        delta_z = self.clamp(
+            dy_px * self.servo_z_gain * scale,
+            -self.servo_xy_step_max,
+            self.servo_xy_step_max,
+        )
+        return delta_y, delta_z
 
     def start_press_phase(self, now_sec: float):
         self.servo_press_start_time = now_sec
-        self.servo_press_start_z = self.servo_cmd_z
-        self.servo_hover_z = self.servo_cmd_z
+        self.servo_press_start_x = self.servo_cmd_x
+        self.servo_hover_x = self.servo_cmd_x
         self.servo_press_succeeded = False
-        self.set_servo_phase('PRESSING_Z')
+        self.set_servo_phase('PRESSING')
 
     def tick_press_phase(self, now_sec: float):
         if self.contact_pressed:
@@ -428,13 +428,13 @@ class TypingCoordinator(Node):
             return
 
         if not self.target_valid or self.current_point is None:
-            self.get_logger().warn('Target lost during PRESSING_Z. Retracting.')
+            self.get_logger().warn('Target lost during PRESSING. Retracting.')
             self.servo_press_succeeded = False
             self.set_servo_phase('RETRACTING')
             return
 
         if self.target_confidence < self.min_confidence:
-            self.get_logger().warn('Confidence dropped during PRESSING_Z. Retracting.')
+            self.get_logger().warn('Confidence dropped during PRESSING. Retracting.')
             self.servo_press_succeeded = False
             self.set_servo_phase('RETRACTING')
             return
@@ -445,7 +445,7 @@ class TypingCoordinator(Node):
             self.set_servo_phase('RETRACTING')
             return
 
-        if abs(self.servo_cmd_z - self.servo_press_start_z) >= self.servo_press_max_travel_m:
+        if abs(self.servo_cmd_x - self.servo_press_start_x) >= self.servo_press_max_travel_m:
             self.get_logger().warn('Press max travel reached before contact. Retracting.')
             self.servo_press_succeeded = False
             self.set_servo_phase('RETRACTING')
@@ -455,11 +455,11 @@ class TypingCoordinator(Node):
             return
 
         px, py = self.current_point
-        delta_x, delta_y = self.compute_xy_servo_delta(px, py, self.servo_press_xy_scale)
+        delta_y, delta_z = self.compute_yz_servo_delta(px, py, self.servo_press_xy_scale)
 
-        next_x = self.servo_cmd_x + delta_x
+        next_x = self.servo_cmd_x + (self.servo_press_direction_sign * self.servo_press_step_m)
         next_y = self.servo_cmd_y + delta_y
-        next_z = self.servo_cmd_z + (self.servo_press_direction_sign * self.servo_press_step_m)
+        next_z = self.servo_cmd_z + delta_z
 
         if not self.is_within_workspace(next_x, next_y, next_z):
             self.get_logger().warn('Press blocked by workspace bounds. Retracting.')
@@ -477,24 +477,24 @@ class TypingCoordinator(Node):
         if (now_sec - self.servo_last_cmd_time) < self.servo_cmd_cooldown_sec:
             return
 
-        next_x = self.servo_cmd_x
         next_y = self.servo_cmd_y
-        dz_to_hover = self.servo_hover_z - self.servo_cmd_z
+        next_z = self.servo_cmd_z
+        dx_to_hover = self.servo_hover_x - self.servo_cmd_x
 
-        if abs(dz_to_hover) <= self.servo_retract_step_m:
-            next_z = self.servo_hover_z
+        if abs(dx_to_hover) <= self.servo_retract_step_m:
+            next_x = self.servo_hover_x
             at_hover = True
         else:
-            next_z = self.servo_cmd_z + self.clamp(dz_to_hover, -self.servo_retract_step_m, self.servo_retract_step_m)
+            next_x = self.servo_cmd_x + self.clamp(dx_to_hover, -self.servo_retract_step_m, self.servo_retract_step_m)
             at_hover = False
 
         if not self.is_within_workspace(next_x, next_y, next_z):
             self.get_logger().warn('Retract blocked by workspace bounds.')
             at_hover = True
-            next_z = self.servo_cmd_z
+            next_x = self.servo_cmd_x
 
         self.publish_cartesian_goal(next_x, next_y, next_z)
-        self.servo_cmd_z = next_z
+        self.servo_cmd_x = next_x
         self.servo_last_cmd_time = now_sec
 
         if not at_hover:
@@ -552,7 +552,7 @@ class TypingCoordinator(Node):
             self.servo_aligned_cycles = 0
             return
 
-        if self.servo_phase == 'PRESSING_Z':
+        if self.servo_phase == 'PRESSING':
             self.tick_press_phase(now_sec)
             return
 
@@ -593,7 +593,7 @@ class TypingCoordinator(Node):
 
         px, py = self.current_point
         dx_px = self.image_center_x - px
-        dy_px = py - self.image_center_y
+        dy_px = self.image_center_y - py
 
         within_enter = (
             abs(dx_px) <= self.servo_align_enter_thresh_px and
@@ -620,11 +620,11 @@ class TypingCoordinator(Node):
             self.set_servo_phase('ALIGN_RATE_LIMIT')
             return
 
-        delta_x, delta_y = self.compute_xy_servo_delta(px, py)
+        delta_y, delta_z = self.compute_yz_servo_delta(px, py)
 
-        next_x = self.servo_cmd_x + delta_x
+        next_x = self.servo_cmd_x
         next_y = self.servo_cmd_y + delta_y
-        next_z = self.servo_cmd_z
+        next_z = self.servo_cmd_z + delta_z
 
         if not self.is_within_workspace(next_x, next_y, next_z):
             self.set_servo_phase('ALIGN_BLOCKED_WORKSPACE')
@@ -634,8 +634,8 @@ class TypingCoordinator(Node):
             return
 
         self.publish_cartesian_goal(next_x, next_y, next_z)
-        self.servo_cmd_x = next_x
         self.servo_cmd_y = next_y
+        self.servo_cmd_z = next_z
         self.servo_last_cmd_time = now_sec
         self.set_servo_phase('ALIGNING')
 

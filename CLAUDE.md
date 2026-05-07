@@ -102,9 +102,9 @@ When `servo_mode_enabled=true`, the coordinator drives the arm through a state m
 
 ```
 IDLE → WAIT_TARGET / WAIT_CONFIDENCE / WAIT_STATE → WAIT_SERVO_INIT
-     → ALIGNING (XY correction via /goal) → ALIGN_HOLD → ALIGNED_READY_PRESS
-     → PRESSING_Z (incremental Z steps via /goal, monitors contact)
-     → RETRACTING → RETURNING_BASE → COMPLETE → WAIT_NEXT_KEY
+     → ALIGNING (YZ correction via /goal — vertical panel) → ALIGN_HOLD → ALIGNED_READY_PRESS
+     → PRESSING (incremental arm-x steps into panel via /goal, monitors contact)
+     → RETRACTING (back along arm-x to hover) → RETURNING_BASE → COMPLETE → WAIT_NEXT_KEY
 ```
 
 Emergency stop (`keyboard/emergency_stop=true`) immediately enters `EMERGENCY_HOLD` and cancels active action goals; releasing it re-arms to IDLE.
@@ -115,7 +115,7 @@ When `servo_mode_enabled=false`, the coordinator uses the `ExecuteKey` action di
 
 Two modes controlled by `use_tf_targeting`:
 
-- **`false` (competition mode)**: heuristic linear mapping. `arm_x = base_x + (dy_px * scale_x_per_px)`, `arm_y = base_y + (dx_px * scale_y_per_px)`. Calibrate `base_x/base_y` by driving the arm over the image-center key and reading `/arm_ik/debug_status`.
+- **`false` (competition mode)**: heuristic linear mapping for a vertical keyboard panel. `arm_x = base_x` (panel face, fixed), `arm_y = base_y + (dx_px * scale_y_per_px)`, `arm_z = target_z + (dy_px * scale_z_per_px)`. Calibrate `base_x/base_y/target_z` by driving the arm to the image-center key and reading `/arm_ik/debug_status`.
 - **`true` (TF mode)**: projects pixel into camera frame using intrinsics at `keyboard_plane_z_m` depth, then transforms via TF from camera frame → `arm_base`. Requires a valid `static_transform_publisher` or real TF from ZED wrapper.
 
 ### Key safety defaults
@@ -125,7 +125,7 @@ Two modes controlled by `use_tf_targeting`:
 | `motion_enabled` | `false` | Master gate; arm will not move until set to `true` |
 | `publish_on_action` | `false` | `arm_node` dry-run; no joint commands published |
 | `require_transform_valid` | `true` (launch: `false`) | Blocks motion if TF lookup fails |
-| `servo_press_direction_sign` | `-1.0` | Flip to `1.0` if press moves away from keyboard |
+| `servo_press_direction_sign` | `+1.0` | Vertical panel: `+1.0` presses into panel (+arm-x). Flip to `-1.0` if press moves away |
 
 ### Debug topics
 

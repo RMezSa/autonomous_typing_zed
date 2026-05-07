@@ -318,4 +318,49 @@ Servo state machine **not yet** adapted — still presses along arm-z. Must be r
 
 ## End-to-end action mode verified in Gazebo
 
-Calibrated sim values: see `SIM_CHECKPOINT.md` for the full bring-up + parameter set. Arm visits each "hola" letter at the correct (y, z) on the vertical panel. Outstanding: servo-mode adaptation for vertical (press direction along arm-x, XY correction → YZ correction).  
+Calibrated sim values: see `SIM_CHECKPOINT.md` for the full bring-up + parameter set. Arm visits each "hola" letter at the correct (y, z) on the vertical panel. Outstanding: servo-mode adaptation for vertical (press direction along arm-x, XY correction → YZ correction).
+
+---
+
+# Update — Servo mode adapted and validated in sim (2026-05-07)
+
+## Servo state machine re-axised for vertical panel
+
+`typing_coordinator.py` — servo loop is no longer horizontal-keyboard:
+- `compute_xy_servo_delta` → `compute_yz_servo_delta`. Returns `(delta_y, delta_z)`.
+  - Horizontal pixel error → arm-y (gain `servo_y_gain_m_per_px`).
+  - Vertical pixel error → arm-z (gain `servo_z_gain_m_per_px`).
+  - Sign convention now matches `pixel_to_arm_goal` (image-up = +z, image-left = +y).
+- Press steps along **arm-x**: `next_x = servo_cmd_x + sign * servo_press_step_m`.
+- Retract returns along arm-x to `servo_hover_x` (snapshot at press start).
+- `servo_press_direction_sign` default flipped `-1.0` → `+1.0` (press into panel = +arm-x).
+- State `PRESSING_Z` → `PRESSING` (axis-agnostic).
+- Docs synced: CLAUDE.md state diagram + safety table, README.md params table, RUNTIME_COMMANDS.md tuning + troubleshooting.
+
+## End-to-end servo mode verified in Gazebo
+
+Full state machine progression validated with manual contact pulses:
+`IDLE → ALIGNING → ALIGN_HOLD → ALIGNED_READY_PRESS → PRESSING → RETRACTING → RETURNING_BASE → COMPLETE → WAIT_NEXT_KEY`.
+`current_key` advances correctly through `h → o → l → a`.
+
+**Sim-only overrides used** (do not carry to hardware):
+- `servo_align_enter_thresh_px:=500.0` — fake vision emits a fixed pixel per key, so the alignment loop has no feedback. Force-passing the threshold lets the rest of the state machine run.
+- `servo_press_xy_scale:=0.0` — disables YZ correction during press. Fake vision's constant pixel error would otherwise drive arm-z monotonically into the workspace floor mid-press.
+- `return_to_base_command:=HOME` — uses the URDF home pose so we don't have to call `SET_KEYBOARD_HOME` first.
+- Slow press tuning so the manual contact pulse can land before max-travel.
+
+## What sim could not validate
+
+- **Sign of YZ pixel-error feedback in `compute_yz_servo_delta`.** The sim feedback loop is broken (fake vision doesn't track the arm), so we couldn't confirm whether the pixel-error → arm-motion sign convention matches the real ZED's mounting orientation. **This is the most likely first-run hardware bug.**
+- `servo_press_direction_sign`. Default `+1.0` assumes `+arm-x` is into the panel; depends on rover arm-base frame.
+- All spatial calibration (`base_x/y`, `target_z`, `scale_y/z_per_px`, `image_center_x/y`).
+- `/keyboard/contact_pressed` source. We pulsed it manually; no real publisher exists yet.
+
+## Hardware bring-up plan
+
+Staged, in `SIM_CHECKPOINT.md` "Hardware bring-up plan":
+1. Action mode + real vision, calibrate spatial constants.
+2. Servo with `servo_press_xy_scale:=0.0` to validate state machine and press direction in real conditions.
+3. Servo with **tiny** YZ feedback gains (~`0.0001`) — moment of truth for sign convention. If `target_px` drifts away from `image_center_x/y` between cycles, flip signs.
+4. Raise gains to nominal, enable press-time YZ correction.
+5. Wire a real `/keyboard/contact_pressed` source.

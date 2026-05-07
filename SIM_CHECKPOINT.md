@@ -1,4 +1,4 @@
-# Simulation Checkpoint — 2026-05-06
+# Simulation Checkpoint — 2026-05-07
 
 Practical bring-up + state guide for the Gazebo simulation testbed.
 **These values are sim-only** — real hardware will need its own calibration.
@@ -7,12 +7,14 @@ Practical bring-up + state guide for the Gazebo simulation testbed.
 
 ## What this checkpoint covers
 
-End-to-end **action-mode** typing pipeline runs in Gazebo:
-fake vision → coordinator → ExecuteKey action → arm_node IK → arm_bridge → JointTrajectoryController → arm motion.
+End-to-end **action mode** and **servo mode** typing pipelines run in Gazebo:
+fake vision → coordinator → (`ExecuteKey` action *or* `/goal` servo loop) → arm_node IK → arm_bridge → JointTrajectoryController → arm motion.
 
-The arm visits each key of "hola" in the correct (y, z) on the vertical panel.
+For both modes, the arm visits each key of "hola" in the correct (y, z) on the vertical panel.
 
-**Servo mode (state machine) is NOT yet adapted for vertical keyboards** — that's the next step.
+**Servo state machine** progresses correctly through every phase
+(`IDLE → ALIGNING → ALIGN_HOLD → ALIGNED_READY_PRESS → PRESSING → RETRACTING → RETURNING_BASE → COMPLETE → WAIT_NEXT_KEY`)
+when given a manual contact pulse.
 
 ---
 
@@ -30,11 +32,21 @@ q5d = radToDeg(q5);
 
 ### 2. `src/zed_aruco/zed_aruco/typing_coordinator.py` — vertical keyboard mapping
 - Removed `scale_x_per_px`, added `scale_z_per_px`.
-- `pixel_to_arm_goal(px, py)` now returns `(x, y, z)`:
+- `pixel_to_arm_goal(px, py)` returns `(x, y, z)`:
   - `x = base_x` (fixed; panel face distance)
   - `y = base_y + dx_px * scale_y_per_px`
   - `z = target_z + dy_px * scale_z_per_px`
-- Both call sites updated to receive the third value.
+
+### 3. `src/zed_aruco/zed_aruco/typing_coordinator.py` — servo state machine re-axised
+- `compute_xy_servo_delta` → `compute_yz_servo_delta`. Returns `(delta_y, delta_z)`.
+  - Horizontal pixel error → arm-y (gain `servo_y_gain_m_per_px`).
+  - Vertical pixel error → arm-z (gain `servo_z_gain_m_per_px`).
+  - Sign convention now matches `pixel_to_arm_goal` (image-up = +z, image-left = +y).
+- Press steps along **arm-x** (was arm-z): `next_x = servo_cmd_x + sign * servo_press_step_m`.
+- Retract returns along arm-x to `servo_hover_x` (snapshot taken at press start).
+- Press travel limit and workspace check now monitor `next_x`.
+- `servo_press_direction_sign` default flipped `-1.0` → `+1.0` (press into panel = +arm-x).
+- State `PRESSING_Z` → `PRESSING` (axis-agnostic).
 
 ---
 
@@ -78,7 +90,7 @@ ros2 run zed_aruco fake_vision_publisher --ros-args \
   -p text:=hola -p loop_text:=true
 ```
 
-### Terminal 5 — typing_coordinator (calibrated for sim)
+### Terminal 5 — typing_coordinator (action mode, default)
 ```bash
 ros2 run zed_aruco typing_coordinator --ros-args \
   -p servo_mode_enabled:=false \
@@ -98,9 +110,50 @@ ros2 run zed_aruco typing_coordinator --ros-args \
   -p scale_z_per_px:=0.0004
 ```
 
-### Terminal 6 — debug watcher (optional)
+### Terminal 5 (alt) — typing_coordinator (servo mode, sim-validated)
+```bash
+ros2 run zed_aruco typing_coordinator --ros-args \
+  -p servo_mode_enabled:=true \
+  -p motion_enabled:=true \
+  -p use_tf_targeting:=false \
+  -p require_transform_valid:=false \
+  -p min_confidence:=0.2 \
+  -p base_x:=0.7 \
+  -p base_y:=0.0 \
+  -p target_z:=0.35 \
+  -p target_pitch:=0.0 \
+  -p workspace_x_max:=1.0 \
+  -p image_center_x:=520.0 \
+  -p image_center_y:=180.0 \
+  -p scale_y_per_px:=0.000288 \
+  -p scale_z_per_px:=0.0004 \
+  -p servo_align_enter_thresh_px:=500.0 \
+  -p servo_align_exit_thresh_px:=600.0 \
+  -p servo_align_stable_cycles:=2 \
+  -p return_to_base_command:=HOME \
+  -p servo_press_step_m:=0.0005 \
+  -p servo_press_max_travel_m:=0.05 \
+  -p servo_press_timeout_sec:=15.0 \
+  -p servo_press_xy_scale:=0.0 \
+  -p return_to_base_wait_sec:=1.5
+```
+
+Why these servo overrides are sim-only (do **not** carry to hardware):
+- `servo_align_enter_thresh_px:=500.0` — fake vision emits a fixed pixel per key; without a real wrist camera the alignment loop has no feedback, so we force-pass the alignment threshold to exercise the rest of the state machine.
+- `servo_press_xy_scale:=0.0` — disables YZ correction during press. With fake vision, the constant pixel error would otherwise drive arm-z monotonically out of the workspace mid-press.
+- `return_to_base_command:=HOME` — uses the unconditional URDF `HOME` predefined pose so we don't have to call `SET_KEYBOARD_HOME` first.
+- Slow press tuning (`servo_press_step_m:=0.0005`, `_max_travel:=0.05`, `_timeout:=15.0`) — extends the `PRESSING` window to ~8 s so the manual contact pulse can land on time.
+
+### Terminal 6 — debug watcher
 ```bash
 ros2 topic echo /keyboard/coordinator_debug
+```
+
+### Terminal 7 — manual contact pulse (servo mode only)
+While `servo_phase` is `PRESSING`:
+```bash
+ros2 topic pub --once /keyboard/contact_pressed std_msgs/msg/Bool '{data: true}'
+ros2 topic pub --once /keyboard/contact_pressed std_msgs/msg/Bool '{data: false}'
 ```
 
 ---
@@ -125,43 +178,80 @@ ros2 topic echo /keyboard/coordinator_debug
 
 ## Quick smoke test
 
-After bringing up Terminals 1–5, watch Gazebo and the debug topic. The arm should:
+After bringing up Terminals 1–5, watch Gazebo and the debug topic.
+
+**Action mode** — the arm should:
 1. Visit each letter of "hola" in turn at `arm_x = 0.7`.
 2. Have `arm_y` vary from ~+0.09 (for "a") to ~−0.04 (for "o", "l").
 3. Have `arm_z` vary from ~0.31 (row 1) to ~0.29 (row 2).
 
-In `coordinator_debug` you should see `mode:action`, `goal_active:true` cycling per key, `current_key` advancing through h → o → l → a.
+`coordinator_debug`: `mode:action`, `goal_active:true` cycling per key, `current_key` advancing through h → o → l → a.
+
+**Servo mode** — start with the alt Terminal 5 and Terminal 7 ready. Per key:
+1. State cycles `WAIT_TARGET → ALIGNING → ALIGN_HOLD → ALIGNED_READY_PRESS → PRESSING`.
+2. Arm steps **forward in +x** (toward the panel) during `PRESSING`.
+3. Fire contact pulse on Terminal 7. Phase moves to `RETRACTING`, arm retreats in −x to `servo_hover_x`.
+4. Phase moves to `RETURNING_BASE`, arm goes to URDF home.
+5. `current_key` advances. Loop continues for `o → l → a`.
+
+If contact pulse is missed, press hits max-travel and retract still runs — `last_goal_result` reflects a non-success retract and the same key retries.
 
 ---
 
-## What's broken / what's next
+## Sim validation results (2026-05-07)
 
-### Servo mode (not yet adapted for vertical keyboards)
-`typing_coordinator.py` servo state machine still assumes a horizontal keyboard:
-- **XY correction** uses `servo_xy_gain_x` (vertical pixel → arm-x) and `servo_xy_gain_y` (horizontal pixel → arm-y). For vertical panels this should be Y/Z (horizontal pixel → arm-y, vertical pixel → arm-z).
-- **Press direction** is z-axis (`servo_press_direction_sign × servo_press_step_m` applied to `servo_cmd_z`). For vertical panels the press should push along **arm-x** (into the panel).
-- Same for retract path and the workspace check inside the servo loop.
+What sim **proved**:
+- State machine flow is correct in both modes (action and servo).
+- Axis assignment for vertical panel: alignment uses Y/Z, press uses +X, retract restores hover X.
+- Initial pose mapping (`pixel_to_arm_goal`) places the arm at the right per-key coordinates.
+- Contact pulse → completion → next-key advancement works (`h → o → l → a`).
+- IK + arm bridge end-to-end: every commanded pose is physically reachable in Gazebo.
 
-Lines to touch (per earlier audit):
-- 50–51, 109–110: rename/reuse `servo_xy_gain_x` → `servo_z_gain`
-- 403, 408: swap which axis the gain corrects
-- 459, 461, 488: change `next_z` to `next_x` for press/retract
-
-Until that's done, only run `servo_mode_enabled:=false` in sim.
-
-### Real-hardware calibration (separate workflow)
-None of the values above carry over to real hardware. Real bring-up will need:
-- Empirical `base_x/y` and `target_z` from physical setup.
-- Empirical `scale_y/z_per_px` from real ZED FOV + keyboard distance.
-- `image_center_x/y` from where the actual keyboard top-center lands in the ZED frame (or, better, the vision node should publish a dynamic reference).
+What sim **did not** prove (these are real-hardware unknowns):
+- Sign of the YZ pixel-error feedback in `compute_yz_servo_delta`. Fake vision emits a fixed pixel per key, so the feedback loop never closes — the broken-in-sim behavior was the reason for `servo_press_xy_scale:=0.0`.
+- `servo_press_direction_sign`. Default `+1.0` assumes `+arm-x` is into the panel; depends on the rover arm-base frame orientation.
+- All spatial calibration (`base_x/y`, `target_z`, `scale_y/z_per_px`, `image_center_x/y`).
+- `/keyboard/contact_pressed` source. We pulsed it manually; no real publisher exists yet.
+- ArUco/vision robustness (dropouts, lighting, occlusions).
 
 ---
 
-## Files modified this session
+## Hardware bring-up plan (staged)
+
+Don't enable full servo on first hardware run. Catch the YZ sign-convention bug early by staging:
+
+1. **Action mode + real vision, calibrate spatial constants.**
+   Bring up real ZED + ArUco + arm_node + typing_coordinator with `servo_mode_enabled:=false`. Drive the arm to a known key with `motion_enabled:=true`. Read `/arm_ik/debug_status` and tune `base_x`, `base_y`, `target_z`, `scale_y/z_per_px`, `image_center_x/y` until the per-key arm-y/z match the physical key positions. (This is RUNTIME_COMMANDS.md section 8.)
+
+2. **Servo mode with YZ feedback disabled.**
+   Set `servo_mode_enabled:=true` and `servo_press_xy_scale:=0.0`. Use real (tight) `servo_align_enter_thresh_px:=8.0`. This validates state-machine flow and press direction in real conditions without trusting the YZ feedback loop. If the arm presses **away** from the panel, set `servo_press_direction_sign:=-1.0`.
+
+3. **Servo mode with low YZ feedback gain.**
+   Set `servo_y_gain_m_per_px:=0.0001` and `servo_z_gain_m_per_px:=0.0001`, leave `servo_press_xy_scale:=0.0` so press is still pure-X. Watch a single alignment cycle in `/keyboard/coordinator_debug`: if `target_px` moves **toward** `image_center_x/y` between cycles, the sign is right. If it moves **away**, flip the sign of the appropriate gain (or invert `dx_px`/`dy_px` in `compute_yz_servo_delta`). **This is the moment of truth.**
+
+4. **Raise gains to nominal, enable press-time YZ correction.**
+   Once signs are confirmed, raise gains to ~`0.00035` and set `servo_press_xy_scale:=0.6` so the wrist fine-tunes YZ during press as the camera image updates.
+
+5. **Wire up a real `/keyboard/contact_pressed` source.**
+   Pick one: physical contact sensor on the gripper, joint-effort spike detection in `arm_node`, vision-based key-depressed detection, or "press-on-max-travel = success" as a fallback.
+
+---
+
+## Open hardware questions
+
+- **Contact detection mechanism** — which of the four options above is feasible for the URC build?
+- **TF mode vs. heuristic mode** — `use_tf_targeting:=true` requires a valid TF tree from the ZED wrapper to `arm_base`. Worth choosing before competition because TF mode generalizes across rover poses, while heuristic mode requires recalibration if the rover or camera shifts.
+- **Real `image_center_x/y`** — currently a static parameter. Should the vision node publish a dynamic reference (e.g., the keyboard centroid) so the servo loop tracks small camera/rover drift without recalibration?
+- **`SET_KEYBOARD_HOME` capture procedure** — for the real run we'll want `KEYBOARD_HOME` (not URDF `HOME`) as the return-to-base pose. Need a documented "drive arm to safe hover, send `SET_KEYBOARD_HOME`" step in the bring-up sequence.
+
+---
+
+## Files modified across sessions
 
 | File | Change |
 |---|---|
 | `src/arm_ik/src/main.cpp` | Removed −90° on q4d (line 102); updated comment |
-| `src/zed_aruco/zed_aruco/typing_coordinator.py` | Vertical-keyboard mapping; `scale_x_per_px` → `scale_z_per_px`; call sites |
+| `src/zed_aruco/zed_aruco/typing_coordinator.py` | Vertical-keyboard mapping; `scale_x_per_px` → `scale_z_per_px`; servo state machine re-axised (YZ alignment, +x press, `PRESSING_Z` → `PRESSING`) |
+| `CLAUDE.md`, `README.md`, `RUNTIME_COMMANDS.md` | Param-name and state-name renames synced with code |
 | `CONTEXT_FOR_CLAUDE.md` | Resolution section appended |
 | `SIM_CHECKPOINT.md` | This file |
