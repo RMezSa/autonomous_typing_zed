@@ -1,0 +1,5 @@
+repositories:
+  mi_rover_description:
+    type: git
+    url: https://github.com/RMezSa/mi_rover_description.git
+    version: main
