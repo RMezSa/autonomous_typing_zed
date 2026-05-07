@@ -92,10 +92,13 @@ class ArmNode : public rclcpp::Node {
             const double q2 = std::atan2(b, a) - std::atan2(l3 * std::sin(q3), l2 + l3 * std::cos(q3));
             const double q4 = pitchRad - q2 - q3;
 
-            q1d = radToDeg(q1);
-            q2d = radToDeg(q2);
-            q3d = radToDeg(q3);
-            q4d = radToDeg(q4);
+            // URDF pitch axes are +Y in base, opposite to the IK's -Y convention, so q2/q3/q4 are negated.
+            // q2 also gets +90° because URDF rest (q2=0) has the upper arm along +Z, while IK rest is +X.
+            // q3 and q4 measure relative to the previous link and are collinear at zero in both conventions, so no offset.
+            q1d = -radToDeg(q1);
+            q2d = -radToDeg(q2) + 90.0;
+            q3d = -radToDeg(q3);
+            q4d = -radToDeg(q4);
             q5d = radToDeg(q5);
 
             const double lim_q1[2] = {-90, 90};
@@ -303,6 +306,8 @@ class ArmNode : public rclcpp::Node {
         feedback->progress = 0.5f;
         goal_handle->publish_feedback(feedback);
 
+        gx_ = goal->x; gy_ = goal->y; gz_ = goal->z;
+        groll_ = goal->roll; gpitch_ = goal->pitch;
         const bool ok = runIKAndPublish(goal->x, goal->y, goal->z, goal->roll, goal->pitch, publish_on_action_);
 
         if (goal_handle->is_canceling()) {

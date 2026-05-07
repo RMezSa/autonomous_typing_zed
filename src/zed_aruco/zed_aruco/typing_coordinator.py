@@ -71,8 +71,8 @@ class TypingCoordinator(Node):
         self.declare_parameter('image_center_y', 360.0)
         self.declare_parameter('base_x', 0.25)
         self.declare_parameter('base_y', 0.0)
-        self.declare_parameter('scale_x_per_px', 0.00035)
         self.declare_parameter('scale_y_per_px', 0.00035)
+        self.declare_parameter('scale_z_per_px', 0.00035)
 
         action_name = self.get_parameter('action_name').value
         done_topic = self.get_parameter('done_topic').value
@@ -133,8 +133,8 @@ class TypingCoordinator(Node):
         self.image_center_y = float(self.get_parameter('image_center_y').value)
         self.base_x = float(self.get_parameter('base_x').value)
         self.base_y = float(self.get_parameter('base_y').value)
-        self.scale_x_per_px = float(self.get_parameter('scale_x_per_px').value)
         self.scale_y_per_px = float(self.get_parameter('scale_y_per_px').value)
+        self.scale_z_per_px = float(self.get_parameter('scale_z_per_px').value)
 
         self.action_client = ActionClient(self, ExecuteKey, action_name)
 
@@ -241,12 +241,16 @@ class TypingCoordinator(Node):
             self.servo_cmd_key = ''
 
     def pixel_to_arm_goal(self, px: float, py: float):
-        dx = self.image_center_x - px
-        dy = py - self.image_center_y
+        # Vertical keyboard panel: arm-x is fixed (panel face distance).
+        # Horizontal pixel offset → arm-y (left/right on panel).
+        # Vertical pixel offset → arm-z (up/down on panel).
+        dx_px = self.image_center_x - px
+        dy_px = self.image_center_y - py
 
-        x = self.base_x + (dy * self.scale_x_per_px)
-        y = self.base_y + (dx * self.scale_y_per_px)
-        return x, y
+        x = self.base_x
+        y = self.base_y + (dx_px * self.scale_y_per_px)
+        z = self.target_z + (dy_px * self.scale_z_per_px)
+        return x, y, z
 
     def pixel_to_camera_point(self, px: float, py: float, frame_id: str):
         z = self.keyboard_plane_z_m
@@ -378,8 +382,7 @@ class TypingCoordinator(Node):
             if self.require_transform_valid and not self.transform_valid:
                 return False
         else:
-            gx, gy = self.pixel_to_arm_goal(px, py)
-            gz = self.target_z
+            gx, gy, gz = self.pixel_to_arm_goal(px, py)
 
         if not self.is_within_workspace(gx, gy, gz):
             return False
@@ -688,8 +691,7 @@ class TypingCoordinator(Node):
             if self.require_transform_valid and not self.transform_valid:
                 return
         else:
-            gx, gy = self.pixel_to_arm_goal(px, py)
-            gz = self.target_z
+            gx, gy, gz = self.pixel_to_arm_goal(px, py)
 
         if not self.is_within_workspace(gx, gy, gz):
             self.get_logger().warn(

@@ -7,6 +7,20 @@ from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Bool, Float32, String
 
 
+SPANISH_KEY_LAYOUT = {
+    '1': (1, 0), '2': (2, 0), '3': (3, 0), '4': (4, 0), '5': (5, 0),
+    '6': (6, 0), '7': (7, 0), '8': (8, 0), '9': (9, 0), '0': (10, 0),
+    "'": (11, 0), '¡': (12, 0),
+    'q': (1, 1), 'w': (2, 1), 'e': (3, 1), 'r': (4, 1), 't': (5, 1),
+    'y': (6, 1), 'u': (7, 1), 'i': (8, 1), 'o': (9, 1), 'p': (10, 1),
+    'a': (1, 2), 's': (2, 2), 'd': (3, 2), 'f': (4, 2), 'g': (5, 2),
+    'h': (6, 2), 'j': (7, 2), 'k': (8, 2), 'l': (9, 2), 'ñ': (10, 2),
+    'z': (2, 3), 'x': (3, 3), 'c': (4, 3), 'v': (5, 3), 'b': (6, 3),
+    'n': (7, 3), 'm': (8, 3), ',': (9, 3), '.': (10, 3), '-': (11, 3),
+    'space': (8, 4),
+}
+
+
 class FakeVisionPublisher(Node):
     def __init__(self):
         super().__init__('fake_vision_publisher')
@@ -18,6 +32,11 @@ class FakeVisionPublisher(Node):
         self.declare_parameter('base_px', 640.0)
         self.declare_parameter('base_py', 360.0)
         self.declare_parameter('jitter_px', 2.0)
+        self.declare_parameter('keyboard_origin_px_x', 100.0)
+        self.declare_parameter('keyboard_origin_px_y', 180.0)
+        self.declare_parameter('cell_width_px', 60.0)
+        self.declare_parameter('cell_height_px', 60.0)
+        self.declare_parameter('use_key_layout', True)
         self.declare_parameter('confidence', 0.95)
         self.declare_parameter('state_when_valid', 'TRACKING')
         self.declare_parameter('state_when_invalid', 'SEARCHING')
@@ -31,6 +50,11 @@ class FakeVisionPublisher(Node):
         self.base_px = float(self.get_parameter('base_px').value)
         self.base_py = float(self.get_parameter('base_py').value)
         self.jitter_px = float(self.get_parameter('jitter_px').value)
+        self.keyboard_origin_px_x = float(self.get_parameter('keyboard_origin_px_x').value)
+        self.keyboard_origin_px_y = float(self.get_parameter('keyboard_origin_px_y').value)
+        self.cell_width_px = float(self.get_parameter('cell_width_px').value)
+        self.cell_height_px = float(self.get_parameter('cell_height_px').value)
+        self.use_key_layout = bool(self.get_parameter('use_key_layout').value)
         self.confidence = float(self.get_parameter('confidence').value)
         self.state_when_valid = str(self.get_parameter('state_when_valid').value)
         self.state_when_invalid = str(self.get_parameter('state_when_invalid').value)
@@ -89,6 +113,17 @@ class FakeVisionPublisher(Node):
             now_sec = self.get_clock().now().nanoseconds * 1e-9
             self.dropout_until = now_sec + max(0.0, self.dropout_duration_sec)
 
+    def pixel_for_key(self, key):
+        if not self.use_key_layout:
+            return self.base_px, self.base_py
+        cell = SPANISH_KEY_LAYOUT.get(key)
+        if cell is None:
+            return self.base_px, self.base_py
+        col, row = cell
+        cx = self.keyboard_origin_px_x + (col + 0.5) * self.cell_width_px
+        cy = self.keyboard_origin_px_y + (row + 0.5) * self.cell_height_px
+        return cx, cy
+
     def tick(self):
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         in_dropout = now_sec < self.dropout_until
@@ -115,8 +150,9 @@ class FakeVisionPublisher(Node):
         if not valid:
             return
 
-        px = self.base_px + self.jitter_px * math.sin(now_sec * 2.0)
-        py = self.base_py + self.jitter_px * math.cos(now_sec * 2.0)
+        cx, cy = self.pixel_for_key(current_key)
+        px = cx + self.jitter_px * math.sin(now_sec * 2.0)
+        py = cy + self.jitter_px * math.cos(now_sec * 2.0)
 
         point_msg = PointStamped()
         point_msg.header.stamp = self.get_clock().now().to_msg()
