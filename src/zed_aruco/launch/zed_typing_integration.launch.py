@@ -42,8 +42,6 @@ def generate_launch_description():
     servo_xy_step_max_arg = DeclareLaunchArgument('servo_xy_step_max_m', default_value='0.003')
     servo_align_enter_arg = DeclareLaunchArgument('servo_align_enter_thresh_px', default_value='8.0')
     servo_align_exit_arg = DeclareLaunchArgument('servo_align_exit_thresh_px', default_value='12.0')
-    servo_align_stable_arg = DeclareLaunchArgument('servo_align_stable_cycles', default_value='4')
-    servo_cmd_cooldown_arg = DeclareLaunchArgument('servo_cmd_cooldown_sec', default_value='0.08')
     servo_press_step_arg = DeclareLaunchArgument('servo_press_step_m', default_value='0.0015')
     servo_press_max_travel_arg = DeclareLaunchArgument('servo_press_max_travel_m', default_value='0.015')
     servo_press_timeout_arg = DeclareLaunchArgument('servo_press_timeout_sec', default_value='10.0')
@@ -108,8 +106,6 @@ def generate_launch_description():
             'servo_xy_step_max_m': LaunchConfiguration('servo_xy_step_max_m'),
             'servo_align_enter_thresh_px': LaunchConfiguration('servo_align_enter_thresh_px'),
             'servo_align_exit_thresh_px': LaunchConfiguration('servo_align_exit_thresh_px'),
-            'servo_align_stable_cycles': LaunchConfiguration('servo_align_stable_cycles'),
-            'servo_cmd_cooldown_sec': LaunchConfiguration('servo_cmd_cooldown_sec'),
             'servo_press_step_m': LaunchConfiguration('servo_press_step_m'),
             'servo_press_max_travel_m': LaunchConfiguration('servo_press_max_travel_m'),
             'servo_press_timeout_sec': LaunchConfiguration('servo_press_timeout_sec'),
@@ -188,8 +184,6 @@ def generate_launch_description():
         servo_xy_step_max_arg,
         servo_align_enter_arg,
         servo_align_exit_arg,
-        servo_align_stable_arg,
-        servo_cmd_cooldown_arg,
         servo_press_step_arg,
         servo_press_max_travel_arg,
         servo_press_timeout_arg,

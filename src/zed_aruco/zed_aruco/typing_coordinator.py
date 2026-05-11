@@ -13,6 +13,18 @@ from tf2_geometry_msgs import do_transform_point
 from typing_interfaces.action import ExecuteKey
 
 
+# Hardcoded tuning constants for the servo loop. These were ROS parameters in earlier
+# revisions but ballooned the config surface; they're back to constants because they're
+# safety/smoothing/pacing values, not per-deployment knobs. Edit here if behavior changes.
+_PLANE_Z_STALE_SEC = 2.0        # measured depth older than this falls back to keyboard_plane_z_m param
+_INTEGRAL_LEAK_PER_SEC = 0.5    # decays integrator state so stale bias fades
+_INTEGRAL_CLAMP_M = 0.005       # max ±meters the integral term can ever command (anti-windup)
+_GOAL_COOLDOWN_SEC = 0.3        # min interval between ExecuteKey action goals
+_SERVO_CMD_COOLDOWN_SEC = 0.08  # min interval between servo /goal publishes (≈12.5 Hz)
+_SERVO_ALIGN_STABLE_CYCLES = 4  # consecutive ticks within enter-threshold before alignment latches
+_RETURN_TO_BASE_WAIT_SEC = 1.0  # how long RETURNING_BASE blocks before allowing next key
+
+
 class TypingCoordinator(Node):
     def __init__(self):
         super().__init__('typing_coordinator')
@@ -24,7 +36,6 @@ class TypingCoordinator(Node):
         self.declare_parameter('target_pitch', -75.0)
         self.declare_parameter('min_confidence', 0.3) #minimal confidence
         self.declare_parameter('required_state', 'TRACKING')
-        self.declare_parameter('goal_cooldown_sec', 0.3)
         self.declare_parameter('accept_dry_run_result', False)
         self.declare_parameter('use_tf_targeting', True)
         self.declare_parameter('arm_base_frame', 'arm_base')
@@ -49,21 +60,24 @@ class TypingCoordinator(Node):
         self.declare_parameter('emergency_stop_topic', 'keyboard/emergency_stop')
         self.declare_parameter('servo_z_gain_m_per_px', 0.00035)
         self.declare_parameter('servo_y_gain_m_per_px', 0.00035)
+        self.declare_parameter('keyboard_plane_z_topic', 'keyboard/plane_z_m')
+
+        # PI integral gains and deadband for the YZ alignment loop. Integral term
+        # is always on; defaults are sized to give roughly Kp / 5s integral action
+        # at the typical geometric gain (~0.0007 m/px at 0.5 m keyboard depth).
+        self.declare_parameter('servo_ki_y_per_px_per_s', 0.0001)
+        self.declare_parameter('servo_ki_z_per_px_per_s', 0.0001)
+        self.declare_parameter('servo_deadband_px', 4.0)
         self.declare_parameter('servo_xy_step_max_m', 0.003)
         self.declare_parameter('servo_align_enter_thresh_px', 8.0)
         self.declare_parameter('servo_align_exit_thresh_px', 12.0)
-        self.declare_parameter('servo_align_stable_cycles', 4)
-        self.declare_parameter('servo_cmd_cooldown_sec', 0.08)
         self.declare_parameter('servo_press_step_m', 0.0015)
         self.declare_parameter('servo_press_max_travel_m', 0.015)
         self.declare_parameter('servo_press_timeout_sec', 2.0)
         self.declare_parameter('servo_press_direction_sign', 1.0)
         self.declare_parameter('servo_press_xy_scale', 0.6)
         self.declare_parameter('servo_retract_step_m', 0.0025)
-        self.declare_parameter('return_to_base_enabled', True)
-        self.declare_parameter('return_to_base_on_failure', True)
         self.declare_parameter('return_to_base_command', 'KEYBOARD_HOME')
-        self.declare_parameter('return_to_base_wait_sec', 1.0)
         self.declare_parameter('debug_status_topic', 'keyboard/coordinator_debug')
         self.declare_parameter('debug_publish_period_sec', 0.25)
 
@@ -82,7 +96,6 @@ class TypingCoordinator(Node):
         self.target_pitch = float(self.get_parameter('target_pitch').value)
         self.min_confidence = float(self.get_parameter('min_confidence').value)
         self.required_state = str(self.get_parameter('required_state').value)
-        self.goal_cooldown_sec = float(self.get_parameter('goal_cooldown_sec').value)
         self.accept_dry_run_result = bool(self.get_parameter('accept_dry_run_result').value)
         self.use_tf_targeting = bool(self.get_parameter('use_tf_targeting').value)
         self.arm_base_frame = str(self.get_parameter('arm_base_frame').value)
@@ -108,21 +121,20 @@ class TypingCoordinator(Node):
         self.emergency_stop_topic = str(self.get_parameter('emergency_stop_topic').value)
         self.servo_z_gain = float(self.get_parameter('servo_z_gain_m_per_px').value)
         self.servo_y_gain = float(self.get_parameter('servo_y_gain_m_per_px').value)
+        plane_z_topic = str(self.get_parameter('keyboard_plane_z_topic').value)
+        self.servo_ki_y = float(self.get_parameter('servo_ki_y_per_px_per_s').value)
+        self.servo_ki_z = float(self.get_parameter('servo_ki_z_per_px_per_s').value)
+        self.servo_deadband_px = float(self.get_parameter('servo_deadband_px').value)
         self.servo_xy_step_max = float(self.get_parameter('servo_xy_step_max_m').value)
         self.servo_align_enter_thresh_px = float(self.get_parameter('servo_align_enter_thresh_px').value)
         self.servo_align_exit_thresh_px = float(self.get_parameter('servo_align_exit_thresh_px').value)
-        self.servo_align_stable_cycles = int(self.get_parameter('servo_align_stable_cycles').value)
-        self.servo_cmd_cooldown_sec = float(self.get_parameter('servo_cmd_cooldown_sec').value)
         self.servo_press_step_m = float(self.get_parameter('servo_press_step_m').value)
         self.servo_press_max_travel_m = float(self.get_parameter('servo_press_max_travel_m').value)
         self.servo_press_timeout_sec = float(self.get_parameter('servo_press_timeout_sec').value)
         self.servo_press_direction_sign = float(self.get_parameter('servo_press_direction_sign').value)
         self.servo_press_xy_scale = float(self.get_parameter('servo_press_xy_scale').value)
         self.servo_retract_step_m = float(self.get_parameter('servo_retract_step_m').value)
-        self.return_to_base_enabled = bool(self.get_parameter('return_to_base_enabled').value)
-        self.return_to_base_on_failure = bool(self.get_parameter('return_to_base_on_failure').value)
         self.return_to_base_command = str(self.get_parameter('return_to_base_command').value)
-        self.return_to_base_wait_sec = float(self.get_parameter('return_to_base_wait_sec').value)
         self.debug_status_topic = str(self.get_parameter('debug_status_topic').value)
         self.debug_publish_period_sec = float(self.get_parameter('debug_publish_period_sec').value)
 
@@ -152,6 +164,13 @@ class TypingCoordinator(Node):
         self.create_subscription(String, 'keyboard/state', self.on_state, 10)
         self.create_subscription(Bool, self.contact_topic, self.on_contact, 10)
         self.create_subscription(Bool, self.emergency_stop_topic, self.on_emergency_stop, 10)
+        self.create_subscription(Float32, plane_z_topic, self.on_plane_z, 10)
+
+        # Measured keyboard plane distance from the ZED depth sensor (via zed_aruco_node).
+        # When fresh and `use_geometric_servo_gains` is true, this replaces the hand-tuned
+        # servo_y_gain / servo_z_gain with geometric values (depth / focal_length).
+        self.measured_plane_z = None
+        self.measured_plane_z_time = 0.0
 
         self.current_key = ''
         self.current_point = None
@@ -186,6 +205,15 @@ class TypingCoordinator(Node):
         self.last_goal_result = 'none'
         self.last_goal_result_message = ''
 
+        # PI state for the YZ alignment loop. Reset on new key and on phase enter to
+        # ALIGNING. Components last_p/i are cached for debug exposure only.
+        self.servo_pid_integral_y = 0.0
+        self.servo_pid_integral_z = 0.0
+        self.servo_pid_last_time = None
+        self.servo_pid_last_p = (0.0, 0.0)
+        self.servo_pid_last_i = (0.0, 0.0)
+        self.servo_pid_last_in_deadband = False
+
         self.create_timer(0.1, self.tick)
         self.create_timer(max(0.05, self.debug_publish_period_sec), self.publish_debug_status)
 
@@ -203,6 +231,7 @@ class TypingCoordinator(Node):
             self.servo_aligned_cycles = 0
             self.servo_cmd_key = ''
             self.servo_press_succeeded = False
+            self.reset_servo_pid_state()
             self.set_servo_phase('IDLE')
 
     def on_target_point(self, msg: PointStamped):
@@ -220,6 +249,36 @@ class TypingCoordinator(Node):
 
     def on_contact(self, msg: Bool):
         self.contact_pressed = bool(msg.data)
+
+    def on_plane_z(self, msg: Float32):
+        self.measured_plane_z = float(msg.data)
+        self.measured_plane_z_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def effective_plane_z(self):
+        """Return measured plane depth (m) if fresh, else fall back to the parameter."""
+        if self.measured_plane_z is None:
+            return self.keyboard_plane_z_m
+        age = (self.get_clock().now().nanoseconds * 1e-9) - self.measured_plane_z_time
+        if age > _PLANE_Z_STALE_SEC:
+            return self.keyboard_plane_z_m
+        return self.measured_plane_z
+
+    def effective_servo_gains(self):
+        """Return (gain_y, gain_z) for compute_yz_servo_delta.
+
+        When a fresh ZED depth measurement is available, return (depth / fx, depth / fy)
+        — the pinhole-projection truth. Otherwise fall back to the hand-tuned parameter
+        values, which is what an older sim or no-depth deployment expects.
+        """
+        if self.measured_plane_z is None:
+            return self.servo_y_gain, self.servo_z_gain
+        age = (self.get_clock().now().nanoseconds * 1e-9) - self.measured_plane_z_time
+        if age > _PLANE_Z_STALE_SEC:
+            return self.servo_y_gain, self.servo_z_gain
+        if self.camera_fx <= 0.0 or self.camera_fy <= 0.0:
+            return self.servo_y_gain, self.servo_z_gain
+        depth = float(self.measured_plane_z)
+        return depth / self.camera_fx, depth / self.camera_fy
 
     def on_emergency_stop(self, msg: Bool):
         previous = self.emergency_stop
@@ -253,7 +312,7 @@ class TypingCoordinator(Node):
         return x, y, z
 
     def pixel_to_camera_point(self, px: float, py: float, frame_id: str):
-        z = self.keyboard_plane_z_m
+        z = self.effective_plane_z()
         x = (px - self.camera_cx) * z / self.camera_fx
         y = (py - self.camera_cy) * z / self.camera_fy
 
@@ -311,6 +370,11 @@ class TypingCoordinator(Node):
         self.servo_state_pub.publish(msg)
 
     def publish_debug_status(self):
+        gain_y, gain_z = self.effective_servo_gains()
+        depth_fresh = (
+            self.measured_plane_z is not None
+            and ((self.get_clock().now().nanoseconds * 1e-9) - self.measured_plane_z_time) <= _PLANE_Z_STALE_SEC
+        )
         debug = {
             'mode': 'servo' if self.servo_mode_enabled else 'action',
             'motion_enabled': bool(self.motion_enabled),
@@ -335,6 +399,27 @@ class TypingCoordinator(Node):
                 'x': float(self.current_point[0]) if self.current_point is not None else None,
                 'y': float(self.current_point[1]) if self.current_point is not None else None,
             },
+            'plane_z_m': {
+                'measured': float(self.measured_plane_z) if self.measured_plane_z is not None else None,
+                'fresh': bool(depth_fresh),
+                'effective': float(self.effective_plane_z()),
+                'source': ('measured' if depth_fresh else 'parameter'),
+            },
+            'servo_gains': {
+                'effective_y': float(gain_y),
+                'effective_z': float(gain_z),
+                'source': ('depth' if depth_fresh else 'param'),
+            },
+            'servo_pi': {
+                'deadband_px': float(self.servo_deadband_px),
+                'in_deadband': bool(self.servo_pid_last_in_deadband),
+                'p': {'y': float(self.servo_pid_last_p[0]), 'z': float(self.servo_pid_last_p[1])},
+                'i': {'y': float(self.servo_pid_last_i[0]), 'z': float(self.servo_pid_last_i[1])},
+                'integral_state': {
+                    'y': float(self.servo_pid_integral_y),
+                    'z': float(self.servo_pid_integral_z),
+                },
+            },
             'last_goal_result': self.last_goal_result,
             'last_goal_result_message': self.last_goal_result_message,
         }
@@ -346,7 +431,21 @@ class TypingCoordinator(Node):
     def set_servo_phase(self, phase: str):
         if phase != self.servo_phase:
             self.get_logger().info(f"Servo phase: {self.servo_phase} -> {phase}")
+            previous_phase = self.servo_phase
             self.servo_phase = phase
+            # Re-entering ALIGNING from a non-aligning phase should restart the loop
+            # from a clean slate so that stale integral / derivative state from a prior
+            # key (or a failed press) doesn't bias the new attempt.
+            if phase == 'ALIGNING' and previous_phase not in ('ALIGNING', 'ALIGN_HOLD'):
+                self.reset_servo_pid_state()
+
+    def reset_servo_pid_state(self):
+        self.servo_pid_integral_y = 0.0
+        self.servo_pid_integral_z = 0.0
+        self.servo_pid_last_time = None
+        self.servo_pid_last_p = (0.0, 0.0)
+        self.servo_pid_last_i = (0.0, 0.0)
+        self.servo_pid_last_in_deadband = False
 
     @staticmethod
     def clamp(value: float, low: float, high: float):
@@ -399,19 +498,62 @@ class TypingCoordinator(Node):
         return True
 
     def compute_yz_servo_delta(self, px: float, py: float, scale: float = 1.0):
+        # Pixel error. Sign convention matches pixel_to_arm_goal: positive dx → target
+        # is left of image center → positive arm-y motion (analogously for dy → arm-z).
+        # Don't change signs without verifying camera↔arm orientation (project memory
+        # flags this as the biggest unverified risk on hardware).
         dx_px = self.image_center_x - px
         dy_px = self.image_center_y - py
 
-        delta_y = self.clamp(
-            dx_px * self.servo_y_gain * scale,
-            -self.servo_xy_step_max,
-            self.servo_xy_step_max,
+        gain_y, gain_z = self.effective_servo_gains()
+
+        # Deadband: inside it, contribute nothing and don't accumulate the integrator.
+        # Stops the loop from chasing sub-pixel jitter and prevents windup on noise.
+        in_deadband = (
+            abs(dx_px) <= self.servo_deadband_px
+            and abs(dy_px) <= self.servo_deadband_px
         )
-        delta_z = self.clamp(
-            dy_px * self.servo_z_gain * scale,
-            -self.servo_xy_step_max,
-            self.servo_xy_step_max,
+        self.servo_pid_last_in_deadband = in_deadband
+
+        # P term.
+        p_y = 0.0 if in_deadband else dx_px * gain_y * scale
+        p_z = 0.0 if in_deadband else dy_px * gain_z * scale
+
+        # I term: leaky integrator with anti-windup. Always active (no PID toggle).
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        if self.servo_pid_last_time is None:
+            dt = 0.0
+        else:
+            # Clamp dt so a long idle pause can't smash the integrator on resume.
+            dt = max(0.0, min(1.0, now_sec - self.servo_pid_last_time))
+        self.servo_pid_last_time = now_sec
+
+        if dt > 0.0:
+            # Decay first (so stale bias fades even if we're currently in deadband),
+            # then accumulate fresh error only when outside the deadband.
+            decay = max(0.0, 1.0 - _INTEGRAL_LEAK_PER_SEC * dt)
+            self.servo_pid_integral_y *= decay
+            self.servo_pid_integral_z *= decay
+            if not in_deadband:
+                self.servo_pid_integral_y += dx_px * self.servo_ki_y * dt
+                self.servo_pid_integral_z += dy_px * self.servo_ki_z * dt
+
+        self.servo_pid_integral_y = self.clamp(
+            self.servo_pid_integral_y, -_INTEGRAL_CLAMP_M, _INTEGRAL_CLAMP_M,
         )
+        self.servo_pid_integral_z = self.clamp(
+            self.servo_pid_integral_z, -_INTEGRAL_CLAMP_M, _INTEGRAL_CLAMP_M,
+        )
+        i_y = self.servo_pid_integral_y * scale if not in_deadband else 0.0
+        i_z = self.servo_pid_integral_z * scale if not in_deadband else 0.0
+
+        # Cache components for the debug topic.
+        self.servo_pid_last_p = (p_y, p_z)
+        self.servo_pid_last_i = (i_y, i_z)
+
+        # Per-tick output clamp: no single tick commands more than ±servo_xy_step_max.
+        delta_y = self.clamp(p_y + i_y, -self.servo_xy_step_max, self.servo_xy_step_max)
+        delta_z = self.clamp(p_z + i_z, -self.servo_xy_step_max, self.servo_xy_step_max)
         return delta_y, delta_z
 
     def start_press_phase(self, now_sec: float):
@@ -451,7 +593,7 @@ class TypingCoordinator(Node):
             self.set_servo_phase('RETRACTING')
             return
 
-        if (now_sec - self.servo_last_cmd_time) < self.servo_cmd_cooldown_sec:
+        if (now_sec - self.servo_last_cmd_time) < _SERVO_CMD_COOLDOWN_SEC:
             return
 
         px, py = self.current_point
@@ -474,7 +616,7 @@ class TypingCoordinator(Node):
         self.servo_last_cmd_time = now_sec
 
     def tick_retract_phase(self, now_sec: float):
-        if (now_sec - self.servo_last_cmd_time) < self.servo_cmd_cooldown_sec:
+        if (now_sec - self.servo_last_cmd_time) < _SERVO_CMD_COOLDOWN_SEC:
             return
 
         next_y = self.servo_cmd_y
@@ -507,22 +649,10 @@ class TypingCoordinator(Node):
         self.servo_return_started = False
         self.servo_return_start_time = 0.0
 
-        should_return_base = self.return_to_base_enabled and (
-            self.servo_press_succeeded or self.return_to_base_on_failure
-        )
-
-        if should_return_base:
-            self.set_servo_phase('RETURNING_BASE')
-            return
-
-        if self.servo_press_succeeded:
-            done_msg = Bool()
-            done_msg.data = True
-            self.done_pub.publish(done_msg)
-            self.set_servo_phase('COMPLETE')
-            self.get_logger().info(f"Servo typing completed for '{self.current_key}'")
-        else:
-            self.set_servo_phase('ALIGNING')
+        # After every press attempt (success or failure) we return to base. The two
+        # toggles that used to gate this were dropped — operationally we always want
+        # the arm clear of the keyboard before evaluating the next key.
+        self.set_servo_phase('RETURNING_BASE')
 
     def tick_return_to_base_phase(self, now_sec: float):
         if not self.servo_return_started:
@@ -531,7 +661,7 @@ class TypingCoordinator(Node):
             self.servo_return_started = True
             return
 
-        if (now_sec - self.servo_return_start_time) < self.return_to_base_wait_sec:
+        if (now_sec - self.servo_return_start_time) < _RETURN_TO_BASE_WAIT_SEC:
             return
 
         self.servo_return_started = False
@@ -606,7 +736,7 @@ class TypingCoordinator(Node):
 
         if within_enter:
             self.servo_aligned_cycles += 1
-            if self.servo_aligned_cycles >= self.servo_align_stable_cycles:
+            if self.servo_aligned_cycles >= _SERVO_ALIGN_STABLE_CYCLES:
                 self.set_servo_phase('ALIGNED_READY_PRESS')
                 self.start_press_phase(now_sec)
             else:
@@ -616,7 +746,7 @@ class TypingCoordinator(Node):
         if outside_exit:
             self.servo_aligned_cycles = 0
 
-        if (now_sec - self.servo_last_cmd_time) < self.servo_cmd_cooldown_sec:
+        if (now_sec - self.servo_last_cmd_time) < _SERVO_CMD_COOLDOWN_SEC:
             self.set_servo_phase('ALIGN_RATE_LIMIT')
             return
 
@@ -671,7 +801,7 @@ class TypingCoordinator(Node):
         if self.required_state and self.current_state != self.required_state:
             return
 
-        if (now_sec - self.last_goal_sent_time) < self.goal_cooldown_sec:
+        if (now_sec - self.last_goal_sent_time) < _GOAL_COOLDOWN_SEC:
             return
 
         if not self.motion_enabled:

@@ -16,16 +16,15 @@ class ZedArucoNode(Node):
         super().__init__('zed_aruco_node')
 
         self.declare_parameter('image_topic', '/zed2i/zed_node/rgb/color/rect/image')
+        self.declare_parameter('depth_topic', '/zed2i/zed_node/depth/depth_registered')
         self.declare_parameter('marker_size', 0.1)  # meters
         self.declare_parameter('aruco_dictionary', 'DICT_4X4_50')
         self.declare_parameter('target_key_label', '')
         self.declare_parameter('homography_hold_seconds', 1.0)
-        self.declare_parameter('use_clahe', True)
-        self.declare_parameter('use_bilateral', True)
-        self.declare_parameter('pose_selection_strategy', 'reprojection_error') # or 'plane_normal'
         self.declare_parameter('marker_ref_is_bottom_right', False)
 
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
+        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         self.marker_size = self.get_parameter('marker_size').get_parameter_value().double_value
         dict_name = self.get_parameter('aruco_dictionary').get_parameter_value().string_value
         self.target_key_label = self.get_parameter('target_key_label').get_parameter_value().string_value
@@ -162,9 +161,16 @@ class ZedArucoNode(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
 
+        # Depth state — used to measure keyboard plane distance and replace the
+        # hand-calibrated servo gain parameters with depth-derived values downstream.
+        self.latest_depth = None
+        self.latest_depth_time = 0.0
+        self.measured_plane_z_ema = None
+
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
         camera_info_topic = image_topic.replace('image', 'camera_info') if 'image' in image_topic else image_topic + '_info'
         self.info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, 10)
+        self.depth_sub = self.create_subscription(Image, depth_topic, self.depth_callback, 10)
 
         self.marker_pub = self.create_publisher(MarkerArray, 'aruco_markers_3d', 10)
         self.debug_pub = self.create_publisher(Image, 'aruco_debug_image', 10)
@@ -173,6 +179,7 @@ class ZedArucoNode(Node):
         self.target_valid_pub = self.create_publisher(Bool, 'keyboard/target_valid', 10)
         self.target_confidence_pub = self.create_publisher(Float32, 'keyboard/target_confidence', 10)
         self.state_pub = self.create_publisher(String, 'keyboard/state', 10)
+        self.keyboard_plane_z_pub = self.create_publisher(Float32, 'keyboard/plane_z_m', 10)
         self.done_sub = self.create_subscription(Bool, 'keyboard/mark_done', self.mark_done_callback, 10)
 
         self.get_logger().info(f"Zed ArUco Keyboard Node Migration Pass - Robustness & IPPE started.")
@@ -320,10 +327,10 @@ class ZedArucoNode(Node):
         return None, roi_debug
 
     def detect_markers_multi_threshold(self, gray_frame):
-        if self.get_parameter('use_clahe').value:
-            gray_frame = self.clahe.apply(gray_frame)
-        if self.get_parameter('use_bilateral').value:
-            gray_frame = cv2.bilateralFilter(gray_frame, self.bilateral_d, self.bilateral_sigma_color, self.bilateral_sigma_space)
+        # CLAHE + bilateral pre-filter is always-on; both are standard ArUco preprocessing
+        # and the cost is negligible on the Jetson.
+        gray_frame = self.clahe.apply(gray_frame)
+        gray_frame = cv2.bilateralFilter(gray_frame, self.bilateral_d, self.bilateral_sigma_color, self.bilateral_sigma_space)
 
         all_corners, all_ids, seen_ids = [], [], set()
         
@@ -496,6 +503,63 @@ class ZedArucoNode(Node):
             point_msg.point.z = 0.0
             self.target_point_pub.publish(point_msg)
 
+    def depth_callback(self, msg):
+        try:
+            if msg.encoding in ('32FC1', '32fc1'):
+                depth = self.bridge.imgmsg_to_cv2(msg, '32FC1')
+            elif msg.encoding in ('16UC1', '16uc1'):
+                # Some ZED configurations publish uint16 millimeters.
+                depth_mm = self.bridge.imgmsg_to_cv2(msg, '16UC1')
+                depth = depth_mm.astype(np.float32) * 1e-3
+            else:
+                return
+        except Exception:
+            return
+        self.latest_depth = depth
+        self.latest_depth_time = self.get_clock().now().nanoseconds * 1e-9
+
+    # Depth sampling tuning — fixed because they're sanity bounds and a smoothing constant,
+    # not knobs that change between rovers. Edit here if behavior needs tuning.
+    _PLANE_Z_EMA_ALPHA = 0.2
+    _PLANE_Z_MIN_M = 0.10
+    _PLANE_Z_MAX_M = 2.0
+    _PLANE_Z_SAMPLE_RADIUS_PX = 2
+
+    def update_keyboard_plane_z(self, sample_points):
+        """Median-filter depth at the given pixel points, EMA-smooth, publish.
+
+        sample_points: iterable of (x, y) pixel coordinates known to lie on the
+        keyboard plane (typically the four inside ArUco corners that bound the quad).
+        """
+        if self.latest_depth is None:
+            return
+        depth_img = self.latest_depth
+        h, w = depth_img.shape[:2]
+        r = self._PLANE_Z_SAMPLE_RADIUS_PX
+        samples = []
+        for pt in sample_points:
+            cx, cy = int(round(pt[0])), int(round(pt[1]))
+            x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+            y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            patch = depth_img[y0:y1, x0:x1]
+            for v in patch.ravel():
+                d = float(v)
+                if np.isfinite(d) and self._PLANE_Z_MIN_M < d < self._PLANE_Z_MAX_M:
+                    samples.append(d)
+        if not samples:
+            return
+        measured = float(np.median(samples))
+        if self.measured_plane_z_ema is None:
+            self.measured_plane_z_ema = measured
+        else:
+            a = self._PLANE_Z_EMA_ALPHA
+            self.measured_plane_z_ema = a * measured + (1.0 - a) * self.measured_plane_z_ema
+        out = Float32()
+        out.data = float(self.measured_plane_z_ema)
+        self.keyboard_plane_z_pub.publish(out)
+
     def image_callback(self, msg):
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         try:
@@ -598,6 +662,10 @@ class ZedArucoNode(Node):
             self.last_good_M, self.last_good_M_inv, self.last_good_M_time = M, M_inv, now_sec
             have_current_view = True
             self.status_text = "ARUCO"
+
+            # Update the measured keyboard plane distance from ZED depth at the four
+            # inside-corner pixels (which lie on the keyboard plane by construction).
+            self.update_keyboard_plane_z(pts_src)
 
         active_M, active_M_inv = None, None
         if have_current_view: active_M, active_M_inv = self.last_good_M, self.last_good_M_inv

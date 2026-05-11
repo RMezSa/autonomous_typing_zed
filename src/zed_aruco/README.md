@@ -46,7 +46,6 @@ Key servo parameters (in `typing_coordinator`):
 - `servo_xy_step_max_m`: max XY increment per control update.
 - `servo_align_enter_thresh_px`: pixel threshold to consider aligned.
 - `servo_align_exit_thresh_px`: larger threshold to re-enter correction (hysteresis).
-- `servo_align_stable_cycles`: consecutive aligned cycles required before press.
 - `servo_press_step_m`: Z increment per press step.
 - `servo_press_max_travel_m`: max total Z travel during a press attempt.
 - `servo_press_timeout_sec`: timeout for contact detection.

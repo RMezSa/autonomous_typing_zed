@@ -4,21 +4,31 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <typing_interfaces/action/execute_key.hpp>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <memory>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <vector>
 
 class ArmNode : public rclcpp::Node {
     public:
         using ExecuteKey = typing_interfaces::action::ExecuteKey;
         using GoalHandleExecuteKey = rclcpp_action::ServerGoalHandle<ExecuteKey>;
+
+        // Internal tuning constants. Were ROS parameters earlier; collapsed because the
+        // operator never tunes these and they cluttered the launch surface.
+        static constexpr double kInterpRateHz = 50.0;
+        static constexpr double kTargetReachedTolDeg = 0.5;
+        static constexpr double kJointStateStaleSec = 2.0;
 
         ArmNode() : Node("arm_node") {
             pub_q1_ = this->create_publisher<std_msgs::msg::Float64>("arm_teleop/joint1", 1);
@@ -31,6 +41,23 @@ class ArmNode : public rclcpp::Node {
             this->declare_parameter("publish_on_action", false);
             publish_on_action_ = this->get_parameter("publish_on_action").as_bool();
 
+            this->declare_parameter("max_step_deg_per_tick", 1.5);
+            this->declare_parameter("start_pose_deg",
+                std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
+            this->declare_parameter("joint_state_topic", std::string("/joint_states"));
+            this->declare_parameter("joint_state_names",
+                std::vector<std::string>{"joint1", "joint2", "joint3", "joint4", "joint5"});
+            this->declare_parameter("joint_state_in_degrees", false);
+
+            max_step_deg_per_tick_ = this->get_parameter("max_step_deg_per_tick").as_double();
+            joint_state_names_ = this->get_parameter("joint_state_names").as_string_array();
+            joint_state_in_degrees_ = this->get_parameter("joint_state_in_degrees").as_bool();
+
+            const auto start_pose = this->get_parameter("start_pose_deg").as_double_array();
+            if (start_pose.size() == 5) {
+                for (size_t i = 0; i < 5; ++i) last_published_deg_[i] = start_pose[i];
+            }
+
             sub_goal_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
                 "/goal", 10,
                 std::bind(&ArmNode::onGoal, this, std::placeholders::_1)
@@ -39,6 +66,12 @@ class ArmNode : public rclcpp::Node {
             sub_predefined_ = this->create_subscription<std_msgs::msg::String>(
                 "/predefined", 10,
                 std::bind(&ArmNode::onPredefined, this, std::placeholders::_1)
+            );
+
+            const std::string js_topic = this->get_parameter("joint_state_topic").as_string();
+            sub_joint_states_ = this->create_subscription<sensor_msgs::msg::JointState>(
+                js_topic, 10,
+                std::bind(&ArmNode::onJointStates, this, std::placeholders::_1)
             );
 
             action_server_ = rclcpp_action::create_server<ExecuteKey>(
@@ -54,7 +87,16 @@ class ArmNode : public rclcpp::Node {
                 std::bind(&ArmNode::publishDebugStatus, this)
             );
 
-            RCLCPP_INFO(this->get_logger(), "arm_node ready. Action publish_on_action=%s", publish_on_action_ ? "true" : "false");
+            interp_timer_ = this->create_wall_timer(
+                std::chrono::milliseconds(static_cast<int>(1000.0 / kInterpRateHz)),
+                std::bind(&ArmNode::tickInterpolator, this)
+            );
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "arm_node ready. publish_on_action=%s max_step=%.2fdeg/tick @ %.1fHz",
+                publish_on_action_ ? "true" : "false",
+                max_step_deg_per_tick_, kInterpRateHz);
         }
 
     private:
@@ -121,16 +163,93 @@ class ArmNode : public rclcpp::Node {
 
         }
 
-    void publishJoints(double q1, double q2, double q3, double q4, double q5Deg) {
+    void publishJointsRaw(const std::array<double, 5> &q) {
         std_msgs::msg::Float64 m;
-        m.data = q1; pub_q1_->publish(m);
-        m.data = q2; pub_q2_->publish(m);
-        m.data = q3; pub_q3_->publish(m);
-        m.data = q4; pub_q4_->publish(m);
+        m.data = q[0]; pub_q1_->publish(m);
+        m.data = q[1]; pub_q2_->publish(m);
+        m.data = q[2]; pub_q3_->publish(m);
+        m.data = q[3]; pub_q4_->publish(m);
 
         std_msgs::msg::Int32 s;
-        s.data = myMap(-90.0, 90.0, 88, 268, q5Deg);
+        s.data = myMap(-90.0, 90.0, 88, 268, q[4]);
         pub_q5_->publish(s);
+    }
+
+    void setTarget(double q1, double q2, double q3, double q4, double q5) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        target_deg_[0] = q1;
+        target_deg_[1] = q2;
+        target_deg_[2] = q3;
+        target_deg_[3] = q4;
+        target_deg_[4] = q5;
+        target_valid_ = true;
+    }
+    
+
+    // Steps last_published_deg_ toward target_deg_ with per-tick proportional clamping.
+    // Proportional (not per-joint independent) preserves the joint-space straight line.
+    void tickInterpolator() {
+        std::array<double, 5> target;
+        std::array<double, 5> last;
+        bool valid;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            target = target_deg_;
+            last = last_published_deg_;
+            valid = target_valid_;
+        }
+        if (!valid) return;
+
+        std::array<double, 5> delta{};
+        double max_abs_delta = 0.0;
+        for (size_t i = 0; i < 5; ++i) {
+            if (!std::isfinite(last[i]) || !std::isfinite(target[i])) return;
+            delta[i] = target[i] - last[i];
+            max_abs_delta = std::max(max_abs_delta, std::abs(delta[i]));
+        }
+        if (max_abs_delta < kTargetReachedTolDeg) return;
+
+        double ratio = 1.0;
+        if (max_abs_delta > max_step_deg_per_tick_) {
+            ratio = max_step_deg_per_tick_ / max_abs_delta;
+        }
+
+        std::array<double, 5> next_q{};
+        for (size_t i = 0; i < 5; ++i) {
+            next_q[i] = last[i] + delta[i] * ratio;
+        }
+
+        publishJointsRaw(next_q);
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            last_published_deg_ = next_q;
+        }
+    }
+
+    void onJointStates(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        std::array<double, 5> tmp{};
+        for (size_t i = 0; i < 5; ++i) {
+            auto it = std::find(msg->name.begin(), msg->name.end(), joint_state_names_[i]);
+            if (it == msg->name.end()) return;
+            const size_t idx = static_cast<size_t>(it - msg->name.begin());
+            if (idx >= msg->position.size()) return;
+            double v = msg->position[idx];
+            if (!joint_state_in_degrees_) v *= 180.0 / M_PI;
+            tmp[i] = v;
+        }
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        joint_state_deg_ = tmp;
+        joint_state_valid_ = true;
+        last_joint_state_time_ = this->get_clock()->now().seconds();
+
+        // Bootstrap: if we haven't accepted a target yet, snap last_published_ to the
+        // measured pose so the first commanded motion ramps from where the arm actually is,
+        // not from the (possibly wrong) `start_pose_deg` parameter.
+        if (!target_valid_) {
+            last_published_deg_ = tmp;
+        }
     }
 
     bool runIKAndPublish(double x, double y, double z, double rollDeg, double pitchDeg, bool publish_commands = true) {
@@ -141,35 +260,87 @@ class ArmNode : public rclcpp::Node {
         if (!inverseKinematics(x, y, z, rollRad, pitchRad, q1, q2, q3, q4, q5)) return false;
 
         if (publish_commands) {
-            publishJoints(q1, q2, q3, q4, q5);
+            setTarget(q1, q2, q3, q4, q5);
         }
 
         last_ik_ok_ = true;
-        last_ik_message_ = publish_commands ? "ik_ok_published" : "ik_ok_dry_run";
+        last_ik_message_ = publish_commands ? "ik_ok_target_set" : "ik_ok_dry_run";
         last_command_time_sec_ = this->get_clock()->now().seconds();
         return true;
     }
 
     void publishDebugStatus() {
+        std::array<double, 5> last;
+        std::array<double, 5> target;
+        std::array<double, 5> js;
+        bool t_valid, js_valid;
+        double js_time;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            last = last_published_deg_;
+            target = target_deg_;
+            js = joint_state_deg_;
+            t_valid = target_valid_;
+            js_valid = joint_state_valid_;
+            js_time = last_joint_state_time_;
+        }
+
+        const double now_sec = this->get_clock()->now().seconds();
+        const double js_age = js_valid ? (now_sec - js_time) : -1.0;
+        const bool js_fresh = js_valid && js_age >= 0.0 && js_age < kJointStateStaleSec;
+
+        double tracking_err = -1.0;
+        if (js_fresh) {
+            tracking_err = 0.0;
+            for (size_t i = 0; i < 5; ++i) {
+                if (!std::isfinite(last[i]) || !std::isfinite(js[i])) {
+                    tracking_err = -1.0;
+                    break;
+                }
+                tracking_err = std::max(tracking_err, std::abs(last[i] - js[i]));
+            }
+        }
+
+        double max_remaining = -1.0;
+        if (t_valid) {
+            max_remaining = 0.0;
+            for (size_t i = 0; i < 5; ++i) {
+                if (!std::isfinite(last[i]) || !std::isfinite(target[i])) {
+                    max_remaining = -1.0;
+                    break;
+                }
+                max_remaining = std::max(max_remaining, std::abs(target[i] - last[i]));
+            }
+        }
+
         std::ostringstream os;
         os << std::fixed << std::setprecision(3)
            << "{"
            << "\"publish_on_action\":" << (publish_on_action_ ? "true" : "false") << ","
-           << "\"last_command_source\":\"" << last_command_source_ << "\"," 
-           << "\"last_predefined\":\"" << last_predefined_ << "\"," 
-           << "\"last_action_key\":\"" << last_action_key_ << "\"," 
-           << "\"last_action_result\":\"" << last_action_result_ << "\"," 
+           << "\"last_command_source\":\"" << last_command_source_ << "\","
+           << "\"last_predefined\":\"" << last_predefined_ << "\","
+           << "\"last_action_key\":\"" << last_action_key_ << "\","
+           << "\"last_action_result\":\"" << last_action_result_ << "\","
            << "\"last_ik_ok\":" << (last_ik_ok_ ? "true" : "false") << ","
-           << "\"last_ik_message\":\"" << last_ik_message_ << "\"," 
+           << "\"last_ik_message\":\"" << last_ik_message_ << "\","
            << "\"last_command_time_sec\":" << last_command_time_sec_ << ","
-           << "\"goal_xyz\":{" 
+           << "\"goal_xyz\":{"
            << "\"x\":" << gx_ << ","
            << "\"y\":" << gy_ << ","
            << "\"z\":" << gz_ << "},"
-           << "\"goal_rp\":{" 
+           << "\"goal_rp\":{"
            << "\"roll\":" << groll_ << ","
            << "\"pitch\":" << gpitch_ << "},"
-           << "\"keyboard_home_set\":" << (kb_home_set_ ? "true" : "false")
+           << "\"keyboard_home_set\":" << (kb_home_set_ ? "true" : "false") << ","
+           << "\"max_step_deg_per_tick\":" << max_step_deg_per_tick_ << ","
+           << "\"target_valid\":" << (t_valid ? "true" : "false") << ","
+           << "\"max_remaining_deg\":" << max_remaining << ","
+           << "\"last_published_deg\":[" << last[0] << "," << last[1] << "," << last[2] << "," << last[3] << "," << last[4] << "],"
+           << "\"target_deg\":[" << target[0] << "," << target[1] << "," << target[2] << "," << target[3] << "," << target[4] << "],"
+           << "\"joint_state_valid\":" << (js_valid ? "true" : "false") << ","
+           << "\"joint_state_age_sec\":" << js_age << ","
+           << "\"joint_state_fresh\":" << (js_fresh ? "true" : "false") << ","
+           << "\"tracking_error_max_deg\":" << tracking_err
            << "}";
 
         std_msgs::msg::String msg;
@@ -348,8 +519,10 @@ class ArmNode : public rclcpp::Node {
 
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_goal_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_predefined_;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_states_;
     rclcpp_action::Server<ExecuteKey>::SharedPtr action_server_;
     rclcpp::TimerBase::SharedPtr debug_timer_;
+    rclcpp::TimerBase::SharedPtr interp_timer_;
     bool publish_on_action_{false};
     std::string last_command_source_{"startup"};
     std::string last_predefined_{"none"};
@@ -358,7 +531,20 @@ class ArmNode : public rclcpp::Node {
     bool last_ik_ok_{false};
     std::string last_ik_message_{"none"};
     double last_command_time_sec_{0.0};
-    
+
+    // Rate-limiter / interpolator state. All accessed under state_mutex_.
+    std::mutex state_mutex_;
+    std::array<double, 5> last_published_deg_{0.0, 0.0, 0.0, 0.0, 0.0};
+    std::array<double, 5> target_deg_{0.0, 0.0, 0.0, 0.0, 0.0};
+    bool target_valid_{false};
+    double max_step_deg_per_tick_{1.5};
+
+    // Joint-state feedback state.
+    std::array<double, 5> joint_state_deg_{0.0, 0.0, 0.0, 0.0, 0.0};
+    bool joint_state_valid_{false};
+    double last_joint_state_time_{0.0};
+    std::vector<std::string> joint_state_names_;
+    bool joint_state_in_degrees_{false};
 };
 
 int main(int argc, char **argv) {
