@@ -181,6 +181,9 @@ class ZedArucoNode(Node):
         self.state_pub = self.create_publisher(String, 'keyboard/state', 10)
         self.keyboard_plane_z_pub = self.create_publisher(Float32, 'keyboard/plane_z_m', 10)
         self.done_sub = self.create_subscription(Bool, 'keyboard/mark_done', self.mark_done_callback, 10)
+        # Headless input: publishing a String here is equivalent to typing ">word"+Enter
+        # in the OpenCV window. Required on the rover where no monitor is attached.
+        self.type_word_sub = self.create_subscription(String, 'keyboard/type_word', self.type_word_callback, 10)
 
         self.get_logger().info(f"Zed ArUco Keyboard Node Migration Pass - Robustness & IPPE started.")
 
@@ -405,6 +408,31 @@ class ZedArucoNode(Node):
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         self.complete_current_key()
         self.typing_cooldown_until = now_sec + self.typing_cooldown_duration
+
+    def type_word_callback(self, msg):
+        # Headless equivalent of typing ">word"+Enter into the OpenCV window. Single-char
+        # strings target one key without entering autonomous mode (mirrors the
+        # one-char-no-> branch in handle_runtime_input).
+        word = msg.data.strip()
+        if not word:
+            return
+        if len(word) == 1:
+            self.target_key_label = word
+            self.autonomous_mode = False
+            self.await_target_acquire = True
+            self.get_logger().info(f"Single-key target via topic: '{word}'")
+            return
+        self.typing_queue.clear()
+        for char in word.lower():
+            if char.strip() or char == ' ':
+                self.typing_queue.append(char if char != ' ' else 'space')
+        if self.typing_queue:
+            self.autonomous_mode = True
+            self.current_typing_target = self.typing_queue.popleft()
+            self.target_key_label = self.current_typing_target
+            self.homography_stable_frames = 0
+            self.await_target_acquire = True
+            self.get_logger().info(f"Autonomous typing queued via topic: '{word}'")
         self.key_track_active = False
 
     def publish_rviz_markers(self, corners, ids, header):

@@ -42,8 +42,12 @@ class ArmNode : public rclcpp::Node {
             publish_on_action_ = this->get_parameter("publish_on_action").as_bool();
 
             this->declare_parameter("max_step_deg_per_tick", 1.5);
+            // Default matches the rover arm's physical rest pose (confirmed by the
+            // quantum_interface UI). Only used as the interpolator's starting point
+            // when /joint_states is missing — if firmware publishes joint feedback,
+            // onJointStates() overrides this on first message anyway.
             this->declare_parameter("start_pose_deg",
-                std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
+                std::vector<double>{0.0, 190.0, -140.0, -50.0, 0.0});
             this->declare_parameter("joint_state_topic", std::string("/joint_states"));
             this->declare_parameter("joint_state_names",
                 std::vector<std::string>{"joint1", "joint2", "joint3", "joint4", "joint5"});

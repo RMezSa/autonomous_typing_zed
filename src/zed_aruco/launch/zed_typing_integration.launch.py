@@ -18,7 +18,7 @@ def generate_launch_description():
 
     target_z_arg = DeclareLaunchArgument('target_z', default_value='0.12')
     target_roll_arg = DeclareLaunchArgument('target_roll', default_value='0.0')
-    target_pitch_arg = DeclareLaunchArgument('target_pitch', default_value='-75.0')
+    target_pitch_arg = DeclareLaunchArgument('target_pitch', default_value='0.0')
     min_conf_arg = DeclareLaunchArgument('min_confidence', default_value='0.2')
     use_tf_targeting_arg = DeclareLaunchArgument('use_tf_targeting', default_value='false')
     arm_base_frame_arg = DeclareLaunchArgument('arm_base_frame', default_value='arm_base')
@@ -29,12 +29,6 @@ def generate_launch_description():
     camera_cx_arg = DeclareLaunchArgument('camera_cx', default_value='640.0')
     camera_cy_arg = DeclareLaunchArgument('camera_cy', default_value='360.0')
     arm_z_offset_arg = DeclareLaunchArgument('arm_z_offset', default_value='0.0')
-    workspace_x_min_arg = DeclareLaunchArgument('workspace_x_min', default_value='-0.10')
-    workspace_x_max_arg = DeclareLaunchArgument('workspace_x_max', default_value='0.55')
-    workspace_y_min_arg = DeclareLaunchArgument('workspace_y_min', default_value='-0.55')
-    workspace_y_max_arg = DeclareLaunchArgument('workspace_y_max', default_value='0.55')
-    workspace_z_min_arg = DeclareLaunchArgument('workspace_z_min', default_value='0.02')
-    workspace_z_max_arg = DeclareLaunchArgument('workspace_z_max', default_value='0.80')
     motion_enabled_arg = DeclareLaunchArgument('motion_enabled', default_value='false')
     require_transform_valid_arg = DeclareLaunchArgument('require_transform_valid', default_value='false')
     enable_calibration_probe_arg = DeclareLaunchArgument('enable_calibration_probe', default_value='false')
@@ -45,13 +39,16 @@ def generate_launch_description():
     servo_press_step_arg = DeclareLaunchArgument('servo_press_step_m', default_value='0.0015')
     servo_press_max_travel_arg = DeclareLaunchArgument('servo_press_max_travel_m', default_value='0.015')
     servo_press_timeout_arg = DeclareLaunchArgument('servo_press_timeout_sec', default_value='10.0')
-    servo_press_direction_arg = DeclareLaunchArgument('servo_press_direction_sign', default_value='-1.0')
+    servo_press_direction_arg = DeclareLaunchArgument('servo_press_direction_sign', default_value='1.0')
     servo_retract_step_arg = DeclareLaunchArgument('servo_retract_step_m', default_value='0.0025')
     contact_topic_arg = DeclareLaunchArgument('contact_topic', default_value='keyboard/contact_pressed')
     base_x_arg = DeclareLaunchArgument('base_x', default_value='0.30')
     base_y_arg = DeclareLaunchArgument('base_y', default_value='0.0')
-    scale_x_per_px_arg = DeclareLaunchArgument('scale_x_per_px', default_value='0.00035')
     scale_y_per_px_arg = DeclareLaunchArgument('scale_y_per_px', default_value='0.00035')
+    scale_z_per_px_arg = DeclareLaunchArgument('scale_z_per_px', default_value='0.00035')
+    camera_info_topic_arg = DeclareLaunchArgument(
+        'camera_info_topic', default_value='/zed2i/zed_node/rgb/camera_info'
+    )
 
     static_tf_enabled_arg = DeclareLaunchArgument('static_tf_enabled', default_value='false')
     static_tf_parent_frame_arg = DeclareLaunchArgument('static_tf_parent_frame', default_value='arm_base')
@@ -94,12 +91,6 @@ def generate_launch_description():
             'camera_cx': LaunchConfiguration('camera_cx'),
             'camera_cy': LaunchConfiguration('camera_cy'),
             'arm_z_offset': LaunchConfiguration('arm_z_offset'),
-            'workspace_x_min': LaunchConfiguration('workspace_x_min'),
-            'workspace_x_max': LaunchConfiguration('workspace_x_max'),
-            'workspace_y_min': LaunchConfiguration('workspace_y_min'),
-            'workspace_y_max': LaunchConfiguration('workspace_y_max'),
-            'workspace_z_min': LaunchConfiguration('workspace_z_min'),
-            'workspace_z_max': LaunchConfiguration('workspace_z_max'),
             'motion_enabled': LaunchConfiguration('motion_enabled'),
             'require_transform_valid': LaunchConfiguration('require_transform_valid'),
             'servo_mode_enabled': LaunchConfiguration('servo_mode_enabled'),
@@ -114,8 +105,9 @@ def generate_launch_description():
             'contact_topic': LaunchConfiguration('contact_topic'),
             'base_x': LaunchConfiguration('base_x'),
             'base_y': LaunchConfiguration('base_y'),
-            'scale_x_per_px': LaunchConfiguration('scale_x_per_px'),
             'scale_y_per_px': LaunchConfiguration('scale_y_per_px'),
+            'scale_z_per_px': LaunchConfiguration('scale_z_per_px'),
+            'camera_info_topic': LaunchConfiguration('camera_info_topic'),
         }]
     )
 
@@ -171,12 +163,6 @@ def generate_launch_description():
         camera_cx_arg,
         camera_cy_arg,
         arm_z_offset_arg,
-        workspace_x_min_arg,
-        workspace_x_max_arg,
-        workspace_y_min_arg,
-        workspace_y_max_arg,
-        workspace_z_min_arg,
-        workspace_z_max_arg,
         motion_enabled_arg,
         require_transform_valid_arg,
         enable_calibration_probe_arg,
@@ -192,8 +178,9 @@ def generate_launch_description():
         contact_topic_arg,
         base_x_arg,
         base_y_arg,
-        scale_x_per_px_arg,
         scale_y_per_px_arg,
+        scale_z_per_px_arg,
+        camera_info_topic_arg,
         static_tf_enabled_arg,
         static_tf_parent_frame_arg,
         static_tf_child_frame_arg,

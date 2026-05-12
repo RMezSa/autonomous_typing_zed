@@ -1,640 +1,373 @@
-# Runtime Commands Cheat Sheet
+# URC Bring-up Manual
+
+Competition-mode bring-up for the autonomous keyboard-typing system. Follow the
+sections in order. The first half (sections 1-7) is the actual run-day procedure;
+the second half (sections 8+) is tuning, troubleshooting, and reference.
 
 ---
 
-## ⚡ URC FULL WORKFLOW — de cero a brazo moviéndose
-
-### PASO 1 — Build (solo la primera vez en esta máquina o si hubo cambios de código)
+## 1. Environment (every new terminal)
 
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
+source install/setup.bash
+```
 
-# Si el build falla con "existing path cannot be removed: Is a directory":
-rm -rf build/typing_interfaces
+## 2. Build
 
-# Build de los 3 paquetes del sistema
+```bash
 colcon build --symlink-install --packages-select typing_interfaces arm_ik zed_aruco
-
 source install/setup.bash
 ```
 
-> **¿Por qué el rm -rf?** Si alguna vez se corrió `colcon build` sin `--symlink-install`,
-> queda un directorio basura en `build/typing_interfaces/` que bloquea futuros builds.
-> Borrarlo lo resuelve completamente.
-
----
-
-### PASO 2 — Abre 3 terminales y sourcea en cada una
+If build fails with `existing path cannot be removed: Is a directory`:
 
 ```bash
-# En cada terminal nueva:
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
+rm -rf build/typing_interfaces
 ```
+
+then re-run the colcon command.
 
 ---
 
-### PASO 3 — Terminal A: lanza el brazo
+## 3. Pre-flight checks (run BEFORE motion)
+
+These confirm wiring before the arm has permission to move. Do them every session.
+
+### 3.1 — Park rover at ~20 cm from keyboard so the ZED sees the full panel.
+
+### 3.2 — Start the arm node and the vision stack in separate terminals.
+
+**Terminal A (arm node, real publish):**
 
 ```bash
 ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
 ```
 
-Debes ver: `arm_node ready. Action publish_on_action=true`
+Wait for: `arm_node ready. publish_on_action=true max_step=1.50deg/tick @ 50.0Hz`
 
----
-
-### PASO 4 — Terminal B: lanza cámara + coordinador
+**Terminal B (vision + coordinator, motion still gated off):**
 
 ```bash
 ros2 launch zed_aruco zed_typing_integration.launch.py
 ```
 
-Sin argumentos. Los defaults ya están configurados para URC:
-- `servo_mode_enabled=true` → lazo cerrado
-- `use_tf_targeting=false` → sin TF, sin mediciones físicas
-- `require_transform_valid=false` → no depende de TF
-- `motion_enabled=false` → seguro, el brazo no se mueve aún
+The launch defaults are already URC-correct:
+- `servo_mode_enabled=true` (closed-loop)
+- `use_tf_targeting=false` (no TF math needed)
+- `require_transform_valid=false`
+- `motion_enabled=false` (master gate)
 
-Espera a ver `TRACKING` en la ventana de OpenCV (la cámara detecta el teclado).
+### 3.3 — Confirm topics are alive.
+
+In a third terminal:
+
+```bash
+# ZED is publishing the image the vision node expects?
+ros2 topic list | grep -E "zed2i.*(image|camera_info|depth)"
+
+# Vision node detected the keyboard?
+ros2 topic echo /keyboard/state --once
+# Expect: "TRACKING" or "ARUCO". If "SEARCHING", check keyboard is in view.
+
+# Firmware publishes joint feedback? (Optional but improves bootstrap.)
+ros2 topic echo /joint_states --once
+# If empty/missing: arm_node will ramp from start_pose_deg=[0,0,0,0,0] on first goal.
+# Either get firmware to publish, or pass -p start_pose_deg:='[...]' to arm_node
+# matching the arm's actual resting pose.
+
+# Coordinator picked up the camera intrinsics?
+ros2 topic echo /keyboard/coordinator_debug --once | grep -E "fx|cx"
+# Should show non-700 values once CameraInfo has arrived.
+```
+
+If any of these fail, stop and fix wiring before continuing.
 
 ---
 
-### PASO 5 — Terminal C: calibración de posición base (una vez por sesión)
+## 4. Calibration (every new physical setup)
+
+The coordinator can't know where the keyboard is in arm-frame coordinates. You teach
+it by driving the arm to the keyboard once and recording two anchor poses.
+
+### 4.1 — Drive arm to touch the center key.
+
+Pick the key closest to the image center (visible in the OpenCV "Keyboard Layout"
+window — usually `g` or `h` for Spanish layout).
+
+Use `/predefined` or `/goal` to position the fingertip directly on that key:
 
 ```bash
-# Mueve el brazo manualmente cerca del centro del teclado
-# Ajusta estos valores hasta que el brazo quede sobre el área central del teclado:
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.0, 0.15, 0.0, -75.0]}" --once
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray \
+  "{data: [0.35, 0.0, 0.30, 0.0, -75.0]}" --once
+# Then nudge with more /goal messages until the tip is exactly on the center key.
+```
 
-# Lee la posición actual del brazo
+### 4.2 — Read the arm's pose and capture the calibration anchors.
+
+```bash
 ros2 topic echo /arm_ik/debug_status --once
-# Busca: "goal_xyz":{"x":0.30,"y":0.0,...}
-
-# Setea esos valores en el coordinador
-ros2 param set /typing_coordinator base_x 0.30   # ← el x que leíste
-ros2 param set /typing_coordinator base_y 0.0    # ← el y que leíste
+# Look for: "goal_xyz":{"x":<X>,"y":<Y>,"z":<Z>}
 ```
+
+Record those three numbers. Then push them into the coordinator:
+
+```bash
+ros2 param set /typing_coordinator base_x   <X>   # arm-X at the panel face
+ros2 param set /typing_coordinator base_y   <Y>   # arm-Y at the center key
+ros2 param set /typing_coordinator target_z <Z>   # arm-Z at the center key
+```
+
+### 4.3 — (Optional, only for speed) Capture a closer between-presses parking pose.
+
+By default the coordinator returns to the hardcoded `INTERMEDIATE` pose
+(0.20 m forward, 0.60 m up) between every keypress. This always works without
+calibration but adds a couple of seconds per key because the arm has to travel
+back from there each time.
+
+If you want faster typing, position the arm a few cm behind the keyboard
+(clear of the panel but close to it), then capture it as `KEYBOARD_HOME`:
+
+```bash
+ros2 topic pub /predefined std_msgs/msg/String "{data: 'SET_KEYBOARD_HOME'}" --once
+```
+
+Then re-launch (or `ros2 param set`) with `return_to_base_command:=KEYBOARD_HOME`.
+You can leave this for later — start with `INTERMEDIATE`, get the system working,
+then optimize.
+
+### 4.4 — Drive the arm back to the camera-view position.
+
+```bash
+ros2 topic pub /predefined std_msgs/msg/String "{data: 'HOME'}" --once
+```
+
+The ZED should now see the full keyboard again.
 
 ---
 
-### PASO 6 — Habilita movimiento
+## 5. Contact-button workaround (until limit switch is wired)
+
+The press loop normally completes when a contact button on the end effector publishes
+`true` on `/keyboard/contact_pressed`. Until that button exists, the code treats
+**reaching `servo_press_max_travel_m` of commanded forward motion** as a successful
+press — by that point, the EE has been stalled against the panel for the last portion
+of the press attempt.
+
+Nothing to configure for this — it's the in-code default behavior. Just be aware:
+
+- `servo_press_max_travel_m` (default `0.015`, i.e. 15 mm) is now also the
+  "definitely contacted" threshold. Tune if you change hover distance.
+- If you happen to want to fake contact manually for one keypress:
+  ```bash
+  ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: true}" --once
+  ```
+
+When the real button is wired up, this fallback stays in place as a safety net: a
+button failure no longer hangs the loop forever.
+
+---
+
+## 6. Enable motion and queue a word
+
+### 6.1 — Queue the word (headless / no-monitor — recommended for competition)
+
+Publish the word on `/keyboard/type_word`. Single char = one key, longer string = autonomous typing of the whole word:
+
+```bash
+# Whole word
+ros2 topic pub /keyboard/type_word std_msgs/msg/String "{data: 'holamundo'}" --once
+
+# Single key
+ros2 topic pub /keyboard/type_word std_msgs/msg/String "{data: 'h'}" --once
+```
+
+No `>` prefix needed — the topic infers autonomous vs single-key from length.
+
+### 6.1b — Alternative: queue via OpenCV window (only if a monitor is attached)
+
+Click into the "ArUco Detection" window so it captures keystrokes. Type `>holamundo` + Enter for a word, or a single character + Enter for one key.
+
+### 6.2 — Flip the master gate:
 
 ```bash
 ros2 param set /typing_coordinator motion_enabled true
 ```
 
-El brazo ahora responde a las teclas detectadas por la cámara.
+The arm now executes each key in sequence: align → press (max-travel reached) →
+retract → return-to-base → next key.
 
 ---
 
-### PASO 7 — Simula el contact durante cada keypress (sin limit switch físico)
+## 7. Emergency stop and clean shutdown
 
-```bash
-# Cuando veas que el brazo llegó a la tecla → activa contact:
-ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: true}" --once
+> **Safety note.** In servo mode (the URC primary path), `arm_node` publishes joint
+> commands regardless of `publish_on_action`. That flag only gates the legacy *action*
+> mode. The single master gate for servo mode is `motion_enabled`: set it to `false`
+> to stop the arm from accepting any new commands.
 
-# El coordinador retrae automáticamente y pasa a la siguiente tecla.
-# Si quieres limpiar el contact manualmente:
-ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: false}" --once
-```
-
----
-
-### Por qué no hay errores anteriores
-
-| Error anterior | Causa | Solución aplicada |
-|---|---|---|
-| `arm_base TF does not exist` | TF habilitado por defecto, sin bridge | Default cambiado a `use_tf_targeting=false` |
-| `ExecuteKey action server not available` | arm_node no estaba corriendo | Se lanza explícito en Terminal A antes del launch |
-| `typing_interfaces build failed` | Build cache corrupto | `rm -rf build/typing_interfaces` antes del colcon |
-| `zed_aruco not found` | Cascada del error de build anterior | Resuelto al arreglar el build |
-
----
-
-## 0) Environment
-
-```bash
-cd /home/roberd/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-```
-
----
-
-## 1) Build
-
-### Build only relevant packages
-
-```bash
-colcon build --symlink-install --packages-select typing_interfaces arm_ik zed_aruco
-source install/setup.bash
-```
-
-### Build only zed_aruco (fast iteration)
-
-```bash
-colcon build --symlink-install --packages-select zed_aruco
-source install/setup.bash
-```
-
----
-
-## 2) Real stack launch (camera + coordinator integration)
-
-### Safe calibration-first bring-up (no motion)
-
-```bash
-ros2 launch zed_aruco zed_typing_integration.launch.py \
-  motion_enabled:=false \
-  use_tf_targeting:=false \
-  require_transform_valid:=false \
-  enable_calibration_probe:=false
-```
-
-### Real execution bring-up — competition mode (no TF, recommended)
-
-> **This is the intended URC approach.** No camera-to-arm measurement needed.
-> Set `base_x/base_y` = arm position when hovering over the key at the image center (see section 8 for calibration workflow).
-> Tune `scale_x_per_px` and `scale_y_per_px` empirically until off-center keys land correctly.
-
-```bash
-ros2 launch zed_aruco zed_typing_integration.launch.py \
-  motion_enabled:=true \
-  use_tf_targeting:=false \
-  require_transform_valid:=false \
-  min_confidence:=0.2
-```
-
-Then at runtime set calibrated values:
-
-```bash
-ros2 param set /typing_coordinator base_x <arm_x_at_image_center>
-ros2 param set /typing_coordinator base_y <arm_y_at_image_center>
-ros2 param set /typing_coordinator scale_x_per_px 0.00035
-ros2 param set /typing_coordinator scale_y_per_px 0.00035
-```
-
-### Real execution bring-up — TF mode (optional, requires physical calibration)
-
-> Only use this if you have pre-measured the camera-to-arm transform.
-> See section 8 for the full TF calibration workflow.
-
-```bash
-ros2 launch zed_aruco zed_typing_integration.launch.py \
-  motion_enabled:=true \
-  use_tf_targeting:=true \
-  require_transform_valid:=true \
-  min_confidence:=0.2 \
-  static_tf_enabled:=true \
-  static_tf_x:=<measured_x_m> \
-  static_tf_y:=<measured_y_m> \
-  static_tf_z:=<measured_z_m> \
-  static_tf_roll:=-1.5708 \
-  static_tf_pitch:=<camera_tilt_rad> \
-  static_tf_yaw:=-1.5708
-```
-
-### Run arm action server in real publish mode
-
-```bash
-ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
-```
-
-### Run arm action server in dry-run mode
-
-```bash
-ros2 run arm_ik arm_node --ros-args -p publish_on_action:=false
-```
-
-### Set and use keyboard-specific home (arm_ik)
-
-```bash
-# 1) Move arm manually (via /goal or predefined) until it reaches desired keyboard home
-# 2) Save current arm target as keyboard home
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'SET_KEYBOARD_HOME'}" --once
-
-# 3) Return to saved keyboard home later
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'KEYBOARD_HOME'}" --once
-```
-
----
-
-## 3) No-hardware simulation launch
-
-### Basic simulation (legacy action flow)
-
-```bash
-ros2 launch zed_aruco no_hardware_integration.launch.py \
-  servo_mode_enabled:=false \
-  motion_enabled:=true \
-  use_tf_targeting:=false \
-  text:=hola
-```
-
-### Servo simulation (ALIGN + PRESS/RETRACT logic)
-
-```bash
-ros2 launch zed_aruco no_hardware_integration.launch.py \
-  servo_mode_enabled:=true \
-  motion_enabled:=true \
-  use_tf_targeting:=false \
-  text:=hola
-```
-
----
-
-## 4) Runtime parameter tuning
-
-### Inspect coordinator params
-
-```bash
-ros2 param list /typing_coordinator
-ros2 param get /typing_coordinator servo_mode_enabled
-```
-
-### Core gates
-
-```bash
-ros2 param set /typing_coordinator motion_enabled true        # master motion gate (true = allow coordinator motion commands)
-ros2 param set /typing_coordinator min_confidence 0.2         # min target confidence [0..1] required to move
-ros2 param set /typing_coordinator required_state TRACKING     # required vision state label before moving
-```
-
-### Servo YZ tuning (vertical panel)
-
-```bash
-ros2 param set /typing_coordinator servo_y_gain_m_per_px 0.00035       # horizontal pixel error → arm-y gain [m/px]
-ros2 param set /typing_coordinator servo_z_gain_m_per_px 0.00035       # vertical pixel error → arm-z gain [m/px]
-ros2 param set /typing_coordinator servo_xy_step_max_m 0.003           # max YZ correction per control update [m] (3 mm)
-ros2 param set /typing_coordinator servo_align_enter_thresh_px 8.0     # "aligned" threshold [px] to enter stable-aligned logic
-ros2 param set /typing_coordinator servo_align_exit_thresh_px 12.0     # drift threshold [px] to leave aligned band (hysteresis)
-ros2 param set /typing_coordinator servo_align_stable_cycles 4          # consecutive in-threshold cycles needed before press
-ros2 param set /typing_coordinator servo_cmd_cooldown_sec 0.08          # min time between sent motion commands [s]
-```
-
-### Servo press/retract tuning
-
-```bash
-ros2 param set /typing_coordinator servo_press_step_m 0.0015            # Z step per press update [m] (1.5 mm)
-ros2 param set /typing_coordinator servo_press_max_travel_m .15         # max total Z press travel [m] before abort/retract
-ros2 param set /typing_coordinator servo_press_timeout_sec 10.0         # max press duration [s] before abort/retract
-ros2 param set /typing_coordinator servo_press_direction_sign -1.0      # Z press direction (-1 or +1 depending on arm frame)
-ros2 param set /typing_coordinator servo_press_xy_scale 0.6             # XY correction multiplier during press (0.6 = 60%)
-ros2 param set /typing_coordinator servo_retract_step_m 0.0025          # Z step per retract update [m] (2.5 mm)
-```
-
-### Return-to-base behavior (after each key)
-
-```bash
-ros2 param set /typing_coordinator return_to_base_enabled true           # enable return-to-base state after retract
-ros2 param set /typing_coordinator return_to_base_on_failure true        # also return to base when press fails
-ros2 param set /typing_coordinator return_to_base_command KEYBOARD_HOME  # /predefined command sent for base return
-ros2 param set /typing_coordinator return_to_base_wait_sec 1.0           # wait time [s] before considering return complete
-```
-
-Notes:
-- `return_to_base_enabled=true` makes servo state machine call `/predefined` with `KEYBOARD_HOME` after retract.
-- `return_to_base_on_failure=true` also returns to base when press failed (timeout/no-contact).
-- Stop condition is timed (`return_to_base_wait_sec`) because real arm pose feedback is not yet integrated.
-
----
-
-## 5) Emergency stop (HOLD, no retract)
-
-### Assert emergency hold
+### 7.1 — Emergency hold during a run
 
 ```bash
 ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: true}" --once
 ```
 
-### Release emergency hold
+The coordinator immediately enters `EMERGENCY_HOLD` and stops issuing /goal commands.
+The arm's interpolator coasts to its last commanded pose and stops there.
+
+Release:
 
 ```bash
 ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: false}" --once
 ```
 
----
-
-## 6) Contact topic (for press completion)
-
-### If no physical button yet, manually simulate contact
+### 7.2 — End-of-session
 
 ```bash
-ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: true}" --once
-```
-
-### Clear contact
-
-```bash
-ros2 topic pub /keyboard/contact_pressed std_msgs/msg/Bool "{data: false}" --once
-```
-
-### Keyboard home commands in arm_ik
-
-```bash
-# Capture keyboard home from current arm target state
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'SET_KEYBOARD_HOME'}" --once
-
-# Move to captured keyboard home
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'KEYBOARD_HOME'}" --once
+ros2 param set /typing_coordinator motion_enabled false
+ros2 topic pub /predefined std_msgs/msg/String "{data: 'HOME'}" --once
+# Then Ctrl+C in each terminal.
 ```
 
 ---
 
-## 7) Useful topic/action diagnostics
+## 8. Live debug topics
 
 ```bash
-ros2 node list
-ros2 topic list
-ros2 action list
-ros2 action info /arm_ik/execute_key
-```
+# Coordinator state, gates, current key, servo command, intrinsics, PI state
+ros2 topic echo /keyboard/coordinator_debug
 
-### Observe vision/coordinator pipeline
+# Arm internals: target/last_published, tracking error vs /joint_states
+ros2 topic echo /arm_ik/debug_status
 
-```bash
-ros2 topic echo /keyboard/target_key
-ros2 topic echo /keyboard/target_valid
-ros2 topic echo /keyboard/target_confidence
-ros2 topic echo /keyboard/state
+# Servo phase string
 ros2 topic echo /keyboard/servo_state
-ros2 topic echo /keyboard/coordinator_debug
-ros2 topic echo /keyboard/mark_done
-ros2 topic echo /keyboard/transform_valid
-```
 
-### Observe command stream to arm (/goal)
-
-```bash
+# What the arm is being commanded to do
 ros2 topic echo /goal
-ros2 topic hz /goal
-```
-
-### Observe arm execution debug status
-
-```bash
-ros2 topic echo /arm_ik/debug_status
-```
-
-Debug topic meaning:
-- `/keyboard/coordinator_debug`: coordinator mode, current gate/state, key, confidence, active servo command xyz, and last action result.
-- `/arm_ik/debug_status`: current arm target xyz/rp, last command source (`/goal`, `/predefined`, or action), and latest IK/action result.
-
----
-
-## 8) Calibration/probe topics (real camera mode)
-
-```bash
-ros2 topic echo /keyboard/target_point_arm
-ros2 topic echo /keyboard/reference_point_arm
-ros2 topic echo /keyboard/calibration_error_m
-```
-
-### Competition calibration workflow (no-TF mode, `use_tf_targeting:=false`)
-
-This approach requires no tape measure or TF math. You calibrate by driving the arm to two reference positions.
-
-**What the parameters mean:**
-- `base_x/base_y`: arm XY position (in arm_base frame) when the arm is hovering over the key that sits at the **image center**
-- `scale_x_per_px`: how many meters the arm moves in X per pixel of vertical image offset (default 0.00035)
-- `scale_y_per_px`: how many meters the arm moves in Y per pixel of horizontal image offset (default 0.00035)
-
-**Step 1 – Find base_x and base_y**
-
-```bash
-# Arm node must be running
-ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
-
-# Drive arm manually to hover over the key at the image center
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [x, y, z, roll, pitch]}" --once
-
-# Read current arm target xyz from debug
-ros2 topic echo /arm_ik/debug_status
-# Note the x and y values → these become base_x and base_y
-```
-
-**Step 2 – Set calibration values at runtime**
-
-```bash
-ros2 param set /typing_coordinator base_x <value_from_step1_x>
-ros2 param set /typing_coordinator base_y <value_from_step1_y>
-```
-
-**Step 3 – Verify and tune scale factors**
-
-1. Enable motion: `ros2 param set /typing_coordinator motion_enabled true`
-2. Command a key that is far from image center (e.g. a corner key)
-3. Observe where the arm lands vs where the key actually is
-4. If overshooting: decrease scale. If undershooting: increase scale:
-```bash
-ros2 param set /typing_coordinator scale_x_per_px 0.00030
-ros2 param set /typing_coordinator scale_y_per_px 0.00030
-```
-5. Repeat until the arm lands on the correct key consistently
-
-**Step 4 – Save confirmed values**
-
-Record the confirmed `base_x`, `base_y`, `scale_x_per_px`, `scale_y_per_px` values here for the next session.
-
-```
-# Confirmed calibration values (fill in after calibration):
-# base_x        = 
-# base_y        = 
-# scale_x_per_px = 
-# scale_y_per_px = 
+ros2 topic hz /goal       # should be ~10-12 Hz during ALIGNING
 ```
 
 ---
 
-### TF calibration workflow (optional — only if NOT using competition mode)
+## 9. Tuning knobs (set via `ros2 param set /typing_coordinator <name> <value>`)
 
-Only required if using `use_tf_targeting:=true`. Requires knowing the physical camera-to-arm transform.
+### Master gates
 
-**Step 1 – Orientation starting values**
+| Param | Default | Effect |
+|---|---|---|
+| `motion_enabled` | `false` | Master gate. Nothing moves until `true`. |
+| `min_confidence` | `0.3` | Min target confidence (0–1) to act. |
+| `required_state` | `TRACKING` | Vision state needed before motion. |
 
-For a camera mounted level and pointing forward (optical convention offset):
-```
-static_tf_roll  := -1.5708   # -π/2, always required for optical frame
-static_tf_pitch := 0.0       # add downward tilt angle in radians if camera is angled
-static_tf_yaw   := -1.5708   # -π/2, always required for optical frame
-```
+### Alignment loop
 
-**Step 2 – Iterative refinement using calibration_probe**
+| Param | Default | Effect |
+|---|---|---|
+| `servo_xy_step_max_m` | `0.003` | Max YZ correction per tick (m). Higher = faster but riskier. |
+| `servo_align_enter_thresh_px` | `8.0` | Pixel error band to enter "aligned." |
+| `servo_align_exit_thresh_px` | `12.0` | Pixel error to leave "aligned" (hysteresis). |
+| `servo_ki_y_per_px_per_s` | `0.0001` | Integral gain Y. Set 0 to disable I. |
+| `servo_ki_z_per_px_per_s` | `0.0001` | Integral gain Z. |
+| `servo_deadband_px` | `4.0` | Pixel error inside which P+I contribute zero. |
 
-```bash
-# Terminal A – arm node
-ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
+### Press / retract
 
-# Terminal B – stack with TF mode
-ros2 launch zed_aruco zed_typing_integration.launch.py \
-  motion_enabled:=false \
-  use_tf_targeting:=true \
-  enable_calibration_probe:=true \
-  static_tf_enabled:=true \
-  static_tf_x:=<estimate_m> \
-  static_tf_y:=<estimate_m> \
-  static_tf_z:=<estimate_m> \
-  static_tf_roll:=-1.5708 \
-  static_tf_pitch:=0.0 \
-  static_tf_yaw:=-1.5708
+| Param | Default | Effect |
+|---|---|---|
+| `servo_press_step_m` | `0.0015` | Per-tick forward step into the panel (m). |
+| `servo_press_max_travel_m` | `0.015` | Max forward commanded travel. Also "contact reached" without a button. |
+| `servo_press_timeout_sec` | `2.0` (real) / `10.0` (launch) | Press abort timer. |
+| `servo_press_direction_sign` | `+1.0` | `+1` presses in +arm-X. Flip if press moves away from panel. |
+| `servo_press_xy_scale` | `0.6` | YZ gain multiplier during press (still corrects, more gently). |
+| `servo_retract_step_m` | `0.0025` | Per-tick backoff after press. |
+| `return_to_base_command` | `INTERMEDIATE` | `/predefined` string sent between keys. `INTERMEDIATE` is always available; switch to `KEYBOARD_HOME` (section 4.3) for faster typing. |
 
-# Terminal C – watch error live (target: < 0.01 m)
-ros2 topic echo /keyboard/calibration_error_m
+### Calibration anchors (set during section 4)
 
-# Terminal D – publish arm reference (arm tip current position)
-ros2 topic pub /keyboard/reference_point_arm geometry_msgs/msg/PointStamped \
-  "{header: {frame_id: 'arm_base'}, point: {x: 0.30, y: 0.05, z: 0.10}}" --once
-```
+| Param | Effect |
+|---|---|
+| `base_x` | Arm-X at the panel face. |
+| `base_y` | Arm-Y at the image-center key. |
+| `target_z` | Arm-Z at the image-center key. |
+| `scale_y_per_px` | Meters of arm-Y per pixel of horizontal offset. |
+| `scale_z_per_px` | Meters of arm-Z per pixel of vertical offset. |
 
-Adjust `static_tf_x/y/z` until error < 0.01 m across 3+ different arm positions.
+### Arm-side (set via `ros2 param set /arm_node`)
 
----
-
-## 9) Clean restart sequence
-
-```bash
-# 1) Stop running launches/processes (Ctrl+C)
-# 2) Rebuild if code changed
-colcon build --symlink-install --packages-select zed_aruco arm_ik typing_interfaces
-# 3) Re-source
-source install/setup.bash
-# 4) Relaunch
-```
-```bash
-#save home, keyboard
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'SET_KEYBOARD_HOME'}" --once
-#return to home, keyboard
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'KEYBOARD_HOME'}" --once
-```
+| Param | Default | Effect |
+|---|---|---|
+| `publish_on_action` | `false` | Must be `true` for the arm to actually move. |
+| `max_step_deg_per_tick` | `1.5` | Per-joint rate limit at 50 Hz (→ 75°/s). |
+| `start_pose_deg` | `[0,0,0,0,0]` | Assumed start pose if `/joint_states` is absent. |
+| `joint_state_topic` | `/joint_states` | Where to subscribe for joint feedback. |
 
 ---
 
-## 10) Hardware bring-up debug checklist (first real run)
+## 10. Troubleshooting
 
-### A) Terminal setup
+### Nothing moves after `motion_enabled=true`
 
-#### Terminal A: arm node (real publish)
+1. `ros2 topic echo /keyboard/coordinator_debug --once` — read `servo_phase`:
+   - `WAIT_TARGET`: vision lost the keyboard. Check the OpenCV window.
+   - `WAIT_CONFIDENCE`: vision unsure. Lower `min_confidence` temporarily.
+   - `WAIT_STATE`: tracker isn't in TRACKING yet. Look at `/keyboard/state`.
+   - `WAIT_SERVO_INIT`: initial servo command failed (IK rejected — outside arm reach). Check `base_x`.
+2. Confirm `publish_on_action=true` on arm_node.
 
-```bash
-cd /home/roberd/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
-```
+### Arm moves away from the key, not toward it
 
-#### Terminal B: vision + coordinator (safe first, competition/no-TF mode)
-
-```bash
-cd /home/roberd/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 launch zed_aruco zed_typing_integration.launch.py \
-  motion_enabled:=false \
-  use_tf_targeting:=false \
-  require_transform_valid:=false
-```
-
-#### Terminal C: live debug watchers
+`servo_press_direction_sign` is flipped. Set to the opposite of current value:
 
 ```bash
-cd /home/roberd/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 topic echo /keyboard/coordinator_debug
+ros2 param set /typing_coordinator servo_press_direction_sign -1.0
 ```
 
-Open a 4th terminal (or split) for arm debug:
+### YZ alignment oscillates / overshoots
+
+Either gains are too high or `camera_fx/fy` defaulted to 700 because CameraInfo
+hasn't been received. Check:
 
 ```bash
-cd /home/roberd/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 topic echo /arm_ik/debug_status
+ros2 topic echo /keyboard/coordinator_debug --once | grep -E "fx|servo_gains"
 ```
 
-### B) Set typing target (word/key)
+If `source: "depth"`, geometric gain is active. If `source: "param"`, lower
+`servo_y_gain_m_per_px` and `servo_z_gain_m_per_px` until smooth.
 
-- Click the OpenCV window so keyboard input is captured.
-- Type `>holamundo` then press Enter to queue autonomous typing.
-- Type `a` then Enter to target one key only.
+### Press always reports failure
 
-### C) Arm motion enable (after checks)
+This shouldn't happen anymore — the max-travel workaround treats every full press as
+success. If it does, check `/keyboard/coordinator_debug` for `last_goal_result` and
+`servo_phase` transitions. Could be target loss mid-press (confidence drop), which is
+an abort, not a press failure.
+
+### Arm leaps when motion is first enabled
+
+`/joint_states` wasn't being read at bootstrap. The arm_node default
+`start_pose_deg=[0, 190, -140, -50, 0]` matches the rover's physical rest pose
+(per the quantum_interface UI), so this should rarely happen with the rover.
+
+If your arm is in a different physical pose at startup:
+
+- Fix the firmware to publish `/joint_states` so bootstrap is automatic, or
+- Restart arm_node with `start_pose_deg` matching the actual rest pose:
+  ```bash
+  ros2 run arm_ik arm_node --ros-args \
+    -p publish_on_action:=true \
+    -p start_pose_deg:='[<q1>, <q2>, <q3>, <q4>, <q5>]'
+  ```
+
+---
+
+## 11. No-hardware simulation
+
+For development without a ZED or arm:
 
 ```bash
-ros2 param set /typing_coordinator motion_enabled true
+ros2 launch zed_aruco no_hardware_integration.launch.py \
+  servo_mode_enabled:=true motion_enabled:=true text:=hola
 ```
 
-### D) Safety controls during run
-
-```bash
-# Emergency hold ON
-ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: true}" --once
-
-# Emergency hold OFF
-ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: false}" --once
-```
-
-### E) Common scenarios and quick fixes
-
-- No movement at all:
-  - `ros2 param get /typing_coordinator motion_enabled` must be `true`.
-  - arm node must run with `publish_on_action:=true`.
-  - check `/keyboard/coordinator_debug` for gate state (`WAIT_TARGET`, `WAIT_STATE`, etc.).
-  - if using `use_tf_targeting:=false`, confirm `base_x/base_y` are set to the arm's actual center-key position (not 0.0):
-    ```bash
-    ros2 param get /typing_coordinator base_x
-    ros2 param get /typing_coordinator base_y
-    ```
-
-- Stuck in `WAIT_CONFIDENCE`:
-  - lower threshold temporarily:
-    ```bash
-    ros2 param set /typing_coordinator min_confidence 0.2
-    ```
-
-- Stuck in `WAIT_STATE`:
-  - ensure tracker reaches `TRACKING`, or relax requirement:
-    ```bash
-    ros2 param set /typing_coordinator required_state TRACKING
-    ```
-
-- Press goes wrong way (away from key):
-  - flip sign (vertical-panel default is `+1.0` = press into panel):
-    ```bash
-    ros2 param set /typing_coordinator servo_press_direction_sign -1.0
-    ```
-  - if that is worse, set it back to `1.0`.
-
-- Oscillation/jitter in YZ align:
-  - reduce gains / step:
-    ```bash
-    ros2 param set /typing_coordinator servo_y_gain_m_per_px 0.00025
-    ros2 param set /typing_coordinator servo_z_gain_m_per_px 0.00025
-    ros2 param set /typing_coordinator servo_xy_step_max_m 0.002
-    ```
-
-- Press timeout before contact:
-  - verify contact topic toggles,
-  - increase timeout slightly:
-    ```bash
-    ros2 param set /typing_coordinator servo_press_timeout_sec 12.0
-    ```
-
-- Workspace blocked warnings:
-  - verify calibration/base frame,
-  - then adjust workspace limits cautiously.
-
-### F) End-of-session safe stop
-
-```bash
-# 1) Emergency hold (optional but recommended)
-ros2 topic pub /keyboard/emergency_stop std_msgs/msg/Bool "{data: true}" --once
-
-# 2) Return to keyboard home
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'KEYBOARD_HOME'}" --once
-
-# 3) Stop launch/node processes with Ctrl+C
-```
+This swaps in `fake_vision_publisher` and `fake_execute_key_server`.

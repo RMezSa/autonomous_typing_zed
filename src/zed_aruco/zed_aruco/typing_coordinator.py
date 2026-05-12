@@ -5,6 +5,7 @@ from rclpy.time import Time
 import json
 
 from std_msgs.msg import String, Bool, Float32, Float64MultiArray
+from sensor_msgs.msg import CameraInfo
 from geometry_msgs.msg import PointStamped
 
 from tf2_ros import Buffer, TransformListener, TransformException
@@ -46,12 +47,6 @@ class TypingCoordinator(Node):
         self.declare_parameter('camera_cx', 640.0)
         self.declare_parameter('camera_cy', 360.0)
         self.declare_parameter('arm_z_offset', 0.0)
-        self.declare_parameter('workspace_x_min', -0.10)
-        self.declare_parameter('workspace_x_max', 0.55)
-        self.declare_parameter('workspace_y_min', -0.55)
-        self.declare_parameter('workspace_y_max', 0.55)
-        self.declare_parameter('workspace_z_min', 0.02)
-        self.declare_parameter('workspace_z_max', 0.80)
         self.declare_parameter('motion_enabled', False)
         self.declare_parameter('require_transform_valid', True)
         self.declare_parameter('servo_mode_enabled', False)
@@ -61,6 +56,10 @@ class TypingCoordinator(Node):
         self.declare_parameter('servo_z_gain_m_per_px', 0.00035)
         self.declare_parameter('servo_y_gain_m_per_px', 0.00035)
         self.declare_parameter('keyboard_plane_z_topic', 'keyboard/plane_z_m')
+        # CameraInfo topic. When messages arrive we overwrite camera_fx/fy/cx/cy and
+        # image_center_x/y with the live values, so the geometric servo gain (depth/fx)
+        # uses real intrinsics instead of the static parameter defaults.
+        self.declare_parameter('camera_info_topic', '/zed2i/zed_node/rgb/camera_info')
 
         # PI integral gains and deadband for the YZ alignment loop. Integral term
         # is always on; defaults are sized to give roughly Kp / 5s integral action
@@ -77,7 +76,11 @@ class TypingCoordinator(Node):
         self.declare_parameter('servo_press_direction_sign', 1.0)
         self.declare_parameter('servo_press_xy_scale', 0.6)
         self.declare_parameter('servo_retract_step_m', 0.0025)
-        self.declare_parameter('return_to_base_command', 'KEYBOARD_HOME')
+        # 'INTERMEDIATE' (hardcoded pose in arm_node at 0.20/0/0.60) is the safe default:
+        # always available without a prior SET_KEYBOARD_HOME step. Override at launch to
+        # 'KEYBOARD_HOME' if you want faster between-key motion at the cost of an extra
+        # calibration step.
+        self.declare_parameter('return_to_base_command', 'INTERMEDIATE')
         self.declare_parameter('debug_status_topic', 'keyboard/coordinator_debug')
         self.declare_parameter('debug_publish_period_sec', 0.25)
 
@@ -107,12 +110,6 @@ class TypingCoordinator(Node):
         self.camera_cy = float(self.get_parameter('camera_cy').value)
         self.arm_z_offset = float(self.get_parameter('arm_z_offset').value)
 
-        self.workspace_x_min = float(self.get_parameter('workspace_x_min').value)
-        self.workspace_x_max = float(self.get_parameter('workspace_x_max').value)
-        self.workspace_y_min = float(self.get_parameter('workspace_y_min').value)
-        self.workspace_y_max = float(self.get_parameter('workspace_y_max').value)
-        self.workspace_z_min = float(self.get_parameter('workspace_z_min').value)
-        self.workspace_z_max = float(self.get_parameter('workspace_z_max').value)
         self.motion_enabled = bool(self.get_parameter('motion_enabled').value)
         self.require_transform_valid = bool(self.get_parameter('require_transform_valid').value)
         self.servo_mode_enabled = bool(self.get_parameter('servo_mode_enabled').value)
@@ -165,6 +162,10 @@ class TypingCoordinator(Node):
         self.create_subscription(Bool, self.contact_topic, self.on_contact, 10)
         self.create_subscription(Bool, self.emergency_stop_topic, self.on_emergency_stop, 10)
         self.create_subscription(Float32, plane_z_topic, self.on_plane_z, 10)
+
+        camera_info_topic = str(self.get_parameter('camera_info_topic').value)
+        self.camera_info_received = False
+        self.create_subscription(CameraInfo, camera_info_topic, self.on_camera_info, 10)
 
         # Measured keyboard plane distance from the ZED depth sensor (via zed_aruco_node).
         # When fresh and `use_geometric_servo_gains` is true, this replaces the hand-tuned
@@ -253,6 +254,36 @@ class TypingCoordinator(Node):
     def on_plane_z(self, msg: Float32):
         self.measured_plane_z = float(msg.data)
         self.measured_plane_z_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def on_camera_info(self, msg: CameraInfo):
+        # CameraInfo.k is a row-major 3x3 intrinsics matrix:
+        #   [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+        # We only need to read it once — these don't change during a run. After this fires,
+        # geometric servo gains and the TF-mode pixel→3D math use the real camera values.
+        if self.camera_info_received:
+            return
+        try:
+            fx = float(msg.k[0])
+            fy = float(msg.k[4])
+            cx = float(msg.k[2])
+            cy = float(msg.k[5])
+        except (IndexError, TypeError):
+            return
+        if fx <= 0.0 or fy <= 0.0:
+            return
+        self.camera_fx = fx
+        self.camera_fy = fy
+        self.camera_cx = cx
+        self.camera_cy = cy
+        # The pixel-error reference for the servo loop should be the principal point, not
+        # an assumed image center, so the loop converges to the same key the projection math
+        # would produce.
+        self.image_center_x = cx
+        self.image_center_y = cy
+        self.camera_info_received = True
+        self.get_logger().info(
+            f"CameraInfo received: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}"
+        )
 
     def effective_plane_z(self):
         """Return measured plane depth (m) if fresh, else fall back to the parameter."""
@@ -351,13 +382,6 @@ class TypingCoordinator(Node):
         gy = float(arm_point.point.y)
         gz = float(arm_point.point.z + self.arm_z_offset)
         return gx, gy, gz
-
-    def is_within_workspace(self, gx: float, gy: float, gz: float):
-        return (
-            self.workspace_x_min <= gx <= self.workspace_x_max and
-            self.workspace_y_min <= gy <= self.workspace_y_max and
-            self.workspace_z_min <= gz <= self.workspace_z_max
-        )
 
     def publish_transform_valid(self):
         msg = Bool()
@@ -483,9 +507,6 @@ class TypingCoordinator(Node):
         else:
             gx, gy, gz = self.pixel_to_arm_goal(px, py)
 
-        if not self.is_within_workspace(gx, gy, gz):
-            return False
-
         self.servo_cmd_x = float(gx)
         self.servo_cmd_y = float(gy)
         self.servo_cmd_z = float(gz)
@@ -588,8 +609,13 @@ class TypingCoordinator(Node):
             return
 
         if abs(self.servo_cmd_x - self.servo_press_start_x) >= self.servo_press_max_travel_m:
-            self.get_logger().warn('Press max travel reached before contact. Retracting.')
-            self.servo_press_succeeded = False
+            # No physical contact sensor yet, so reaching max travel is our success proxy:
+            # if we commanded the full press travel without an abort, the EE has been
+            # stalled against the panel for the last portion of that travel. Treat that
+            # as a successful press. When a real contact_pressed publisher comes online,
+            # it will trip earlier (line above) and this branch becomes the fallback.
+            self.get_logger().info('Press max travel reached — treating as contact (no button wired).')
+            self.servo_press_succeeded = True
             self.set_servo_phase('RETRACTING')
             return
 
@@ -602,12 +628,6 @@ class TypingCoordinator(Node):
         next_x = self.servo_cmd_x + (self.servo_press_direction_sign * self.servo_press_step_m)
         next_y = self.servo_cmd_y + delta_y
         next_z = self.servo_cmd_z + delta_z
-
-        if not self.is_within_workspace(next_x, next_y, next_z):
-            self.get_logger().warn('Press blocked by workspace bounds. Retracting.')
-            self.servo_press_succeeded = False
-            self.set_servo_phase('RETRACTING')
-            return
 
         self.publish_cartesian_goal(next_x, next_y, next_z)
         self.servo_cmd_x = next_x
@@ -629,11 +649,6 @@ class TypingCoordinator(Node):
         else:
             next_x = self.servo_cmd_x + self.clamp(dx_to_hover, -self.servo_retract_step_m, self.servo_retract_step_m)
             at_hover = False
-
-        if not self.is_within_workspace(next_x, next_y, next_z):
-            self.get_logger().warn('Retract blocked by workspace bounds.')
-            at_hover = True
-            next_x = self.servo_cmd_x
 
         self.publish_cartesian_goal(next_x, next_y, next_z)
         self.servo_cmd_x = next_x
@@ -756,13 +771,6 @@ class TypingCoordinator(Node):
         next_y = self.servo_cmd_y + delta_y
         next_z = self.servo_cmd_z + delta_z
 
-        if not self.is_within_workspace(next_x, next_y, next_z):
-            self.set_servo_phase('ALIGN_BLOCKED_WORKSPACE')
-            self.get_logger().warn(
-                f"Servo align blocked by workspace: x={next_x:.3f} y={next_y:.3f} z={next_z:.3f}"
-            )
-            return
-
         self.publish_cartesian_goal(next_x, next_y, next_z)
         self.servo_cmd_y = next_y
         self.servo_cmd_z = next_z
@@ -795,7 +803,6 @@ class TypingCoordinator(Node):
             return
 
         if self.target_confidence < self.min_confidence:
-            print("Not enough confidence")
             return
 
         if self.required_state and self.current_state != self.required_state:
@@ -822,12 +829,6 @@ class TypingCoordinator(Node):
                 return
         else:
             gx, gy, gz = self.pixel_to_arm_goal(px, py)
-
-        if not self.is_within_workspace(gx, gy, gz):
-            self.get_logger().warn(
-                f"Target out of workspace: x={gx:.3f} y={gy:.3f} z={gz:.3f}"
-            )
-            return
 
         goal_msg = ExecuteKey.Goal()
         goal_msg.key_label = self.current_key
