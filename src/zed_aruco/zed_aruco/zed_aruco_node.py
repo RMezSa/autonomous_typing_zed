@@ -7,15 +7,43 @@ from std_msgs.msg import String, Bool, Float32
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+import os
 import time
 from collections import deque
 from typing import List, Tuple, Optional
+
+
+def _detect_opencv_gui_available():
+    """Return True only if cv2 can actually open windows here.
+
+    On headless Jetson deployments either DISPLAY is unset (no X server attached)
+    or the installed wheel is opencv-python-headless (GUI symbols compiled out).
+    In both cases imshow/waitKey raise cv2.error inside the image callback, which
+    silently kills the detection loop. Detect once at startup so we can skip the
+    GUI calls cleanly.
+    """
+    if not os.environ.get('DISPLAY'):
+        return False
+    try:
+        probe = '__zed_aruco_gui_probe__'
+        cv2.namedWindow(probe, cv2.WINDOW_NORMAL)
+        cv2.destroyWindow(probe)
+        return True
+    except cv2.error:
+        return False
+    except Exception:
+        return False
 
 class ZedArucoNode(Node):
     def __init__(self):
         super().__init__('zed_aruco_node')
 
         self.declare_parameter('image_topic', '/zed2i/zed_node/rgb/color/rect/image')
+        # Real ZED ROS 2 wrapper publishes camera_info at /<camera>/zed_node/rgb/camera_info,
+        # not at .../rgb/color/rect/camera_info. Declaring this explicitly avoids the
+        # silent-failure mode where a string-replace from image_topic produced a topic
+        # nobody published and self.camera_matrix stayed None forever.
+        self.declare_parameter('camera_info_topic', '/zed2i/zed_node/rgb/camera_info')
         self.declare_parameter('depth_topic', '/zed2i/zed_node/depth/depth_registered')
         self.declare_parameter('marker_size', 0.1)  # meters
         self.declare_parameter('aruco_dictionary', 'DICT_4X4_50')
@@ -168,7 +196,7 @@ class ZedArucoNode(Node):
         self.measured_plane_z_ema = None
 
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
-        camera_info_topic = image_topic.replace('image', 'camera_info') if 'image' in image_topic else image_topic + '_info'
+        camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         self.info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, 10)
         self.depth_sub = self.create_subscription(Image, depth_topic, self.depth_callback, 10)
 
@@ -184,6 +212,15 @@ class ZedArucoNode(Node):
         # Headless input: publishing a String here is equivalent to typing ">word"+Enter
         # in the OpenCV window. Required on the rover where no monitor is attached.
         self.type_word_sub = self.create_subscription(String, 'keyboard/type_word', self.type_word_callback, 10)
+
+        self.gui_enabled = _detect_opencv_gui_available()
+        if self.gui_enabled:
+            self.get_logger().info("OpenCV GUI enabled: imshow windows + waitKey runtime input.")
+        else:
+            self.get_logger().info(
+                "OpenCV GUI disabled (headless): all imshow/waitKey calls skipped. "
+                "Use keyboard/type_word topic for runtime typing input."
+            )
 
         self.get_logger().info(f"Zed ArUco Keyboard Node Migration Pass - Robustness & IPPE started.")
 
@@ -472,6 +509,8 @@ class ZedArucoNode(Node):
         return Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw))
 
     def handle_runtime_input(self, now_sec):
+        if not self.gui_enabled:
+            return
         key = cv2.waitKey(1) & 0xFF
         if key != 255:
             if key in (10, 13):
@@ -639,7 +678,8 @@ class ZedArucoNode(Node):
                 self.handle_runtime_input(now_sec)
                 self.publish_integration_topics(msg.header, (filtered[0], filtered[1]))
                 self.publish_debug_image(cv_image, msg.header)
-                cv2.imshow("ArUco Detection", cv_image)
+                if self.gui_enabled:
+                    cv2.imshow("ArUco Detection", cv_image)
                 self.prev_gray = gray
                 return
             else:
@@ -661,6 +701,18 @@ class ZedArucoNode(Node):
 
         # ArUco / Flow / Hold logic for homography
         fresh_markers = {mid: c for mid, c in self.last_known_corners.items() if (now_sec - self.last_seen_timestamp.get(mid, 0)) < self.STALE_THRESHOLD_SECONDS}
+        # When other DICT_4X4_50 markers are in the scene (URC nav/science tags), more than
+        # four fresh markers can be present. Pick the four with the largest detected quad
+        # area — the keyboard markers are within arm reach (large in frame), other URC
+        # markers are typically distant/smaller, so the four biggest reliably correspond
+        # to the keyboard.
+        if len(fresh_markers) > 4:
+            ranked = sorted(
+                fresh_markers.items(),
+                key=lambda kv: cv2.contourArea(kv[1][0].astype(np.float32)),
+                reverse=True,
+            )
+            fresh_markers = {mid: c for mid, c in ranked[:4]}
         have_current_view = False
         if len(fresh_markers) == 4:
             centers = {mid: np.mean(c[0], axis=0) for mid, c in fresh_markers.items()}
@@ -747,9 +799,10 @@ class ZedArucoNode(Node):
                     target_center_warp = k_in_warp.reshape(4, 2).mean(axis=0)
                     cv2.circle(layout_img, (int(kx+kw/2), int(ky+kh/2)), 4, (0, 0, 255), -1)
 
-            cv2.imshow("Warped ROI", warped)
-            cv2.imshow("Keyboard Layout (Canonical)", layout_img)
-            cv2.imshow("Keyboard Layout (Warped)", warped_overlay)
+            if self.gui_enabled:
+                cv2.imshow("Warped ROI", warped)
+                cv2.imshow("Keyboard Layout (Canonical)", layout_img)
+                cv2.imshow("Keyboard Layout (Warped)", warped_overlay)
             
             if target_center_warp is not None and self.target_key_label:
                 target_real_final = cv2.perspectiveTransform(np.array([[[target_center_warp[0], target_center_warp[1]]]], dtype="float32"), active_M_inv)[0][0]
@@ -790,7 +843,8 @@ class ZedArucoNode(Node):
             cv2.putText(cv_image, f"AUTO QUEUE: {queue_str}", (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.putText(cv_image, f"STATE: {self.status_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        cv2.imshow("ArUco Detection", cv_image)
+        if self.gui_enabled:
+            cv2.imshow("ArUco Detection", cv_image)
         self.handle_runtime_input(now_sec)
         publish_target = (float(target_real_final[0]), float(target_real_final[1])) if target_real_final is not None else None
         self.publish_integration_topics(msg.header, publish_target)

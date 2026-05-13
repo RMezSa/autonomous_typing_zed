@@ -25,8 +25,8 @@ setup(
     zip_safe=True,
     maintainer='roberd',
     maintainer_email='roberd@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Standalone ROS 2 ArUco detector for non-ZED image sources.',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',

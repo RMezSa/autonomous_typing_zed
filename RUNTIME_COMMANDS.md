@@ -71,11 +71,16 @@ ros2 topic list | grep -E "zed2i.*(image|camera_info|depth)"
 ros2 topic echo /keyboard/state --once
 # Expect: "TRACKING" or "ARUCO". If "SEARCHING", check keyboard is in view.
 
-# Firmware publishes joint feedback? (Optional but improves bootstrap.)
+# Joint feedback is reaching arm_node? The bridge node converts the firmware's
+# /arm_feedback/jointN_deg (Float64 each, deg) into /joint_states (rad).
 ros2 topic echo /joint_states --once
-# If empty/missing: arm_node will ramp from start_pose_deg=[0,0,0,0,0] on first goal.
-# Either get firmware to publish, or pass -p start_pose_deg:='[...]' to arm_node
-# matching the arm's actual resting pose.
+# Expect: name: [joint1, joint2, joint3, joint4] and position in radians.
+# joint5 is intentionally omitted (no feedback on the gripper servo).
+#
+# If empty: check the raw firmware topics directly —
+ros2 topic echo /arm_feedback/joint2_deg --once
+# If those are silent, the firmware isn't publishing. arm_node will then ramp
+# from start_pose_deg=[0,190,-140,-50,0] (the rover's documented rest pose).
 
 # Coordinator picked up the camera intrinsics?
 ros2 topic echo /keyboard/coordinator_debug --once | grep -E "fx|cx"
@@ -126,14 +131,31 @@ By default the coordinator returns to the hardcoded `INTERMEDIATE` pose
 calibration but adds a couple of seconds per key because the arm has to travel
 back from there each time.
 
-If you want faster typing, position the arm a few cm behind the keyboard
-(clear of the panel but close to it), then capture it as `KEYBOARD_HOME`:
+If you want faster typing, hand-drive the arm via `/goal` or `/predefined`
+commands until the EE is a few cm behind the keyboard (clear of the panel,
+camera still seeing the full layout). Then capture the **measured joint angles**
+as the keyboard home (joint-space variant — replays exact joint pose, bypasses IK):
 
 ```bash
-ros2 topic pub /predefined std_msgs/msg/String "{data: 'SET_KEYBOARD_HOME'}" --once
+ros2 topic pub /predefined std_msgs/msg/String \
+  "{data: 'SET_KEYBOARD_HOME_JOINTS'}" --once
 ```
 
-Then re-launch (or `ros2 param set`) with `return_to_base_command:=KEYBOARD_HOME`.
+Verify it was captured:
+
+```bash
+ros2 topic echo /arm_ik/debug_status --once | grep joint_keyboard_home_set
+# Expect: "joint_keyboard_home_set":true
+```
+
+Then re-launch (or `ros2 param set`) with
+`return_to_base_command:=KEYBOARD_HOME_JOINTS`. Same exact pose every time, no IK
+branch ambiguity, no Cartesian re-solve.
+
+(The older Cartesian `SET_KEYBOARD_HOME` / `KEYBOARD_HOME` commands still exist
+but capture the last *commanded* xyz instead of measured joints — joint-space is
+preferred when `/joint_states` is healthy.)
+
 You can leave this for later — start with `INTERMEDIATE`, get the system working,
 then optimize.
 
@@ -282,7 +304,7 @@ ros2 topic hz /goal       # should be ~10-12 Hz during ALIGNING
 | `servo_press_direction_sign` | `+1.0` | `+1` presses in +arm-X. Flip if press moves away from panel. |
 | `servo_press_xy_scale` | `0.6` | YZ gain multiplier during press (still corrects, more gently). |
 | `servo_retract_step_m` | `0.0025` | Per-tick backoff after press. |
-| `return_to_base_command` | `INTERMEDIATE` | `/predefined` string sent between keys. `INTERMEDIATE` is always available; switch to `KEYBOARD_HOME` (section 4.3) for faster typing. |
+| `return_to_base_command` | `INTERMEDIATE` | `/predefined` string sent between keys. `INTERMEDIATE` is always available; switch to `KEYBOARD_HOME_JOINTS` (section 4.3) for faster typing. |
 
 ### Calibration anchors (set during section 4)
 
@@ -300,8 +322,8 @@ ros2 topic hz /goal       # should be ~10-12 Hz during ALIGNING
 |---|---|---|
 | `publish_on_action` | `false` | Must be `true` for the arm to actually move. |
 | `max_step_deg_per_tick` | `1.5` | Per-joint rate limit at 50 Hz (→ 75°/s). |
-| `start_pose_deg` | `[0,0,0,0,0]` | Assumed start pose if `/joint_states` is absent. |
-| `joint_state_topic` | `/joint_states` | Where to subscribe for joint feedback. |
+| `start_pose_deg` | `[0, 190, -140, -50, 0]` | Assumed start pose if `/joint_states` is absent. Matches rover rest pose. |
+| `joint_state_topic` | `/joint_states` | Where to subscribe for joint feedback. The bridge node publishes here from `/arm_feedback/jointN_deg`. |
 
 ---
 

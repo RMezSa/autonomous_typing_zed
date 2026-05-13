@@ -18,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='roberd',
     maintainer_email='rbdego@gmail.com',
-    description='TODO: Package description',
+    description='ZED ArUco keyboard vision and typing coordinator nodes.',
     license='Apache-2.0',
     extras_require={
         'test': [
@@ -31,7 +31,8 @@ setup(
             'typing_coordinator = zed_aruco.typing_coordinator:main',
             'calibration_probe = zed_aruco.calibration_probe:main',
             'fake_vision_publisher = zed_aruco.fake_vision_publisher:main',
-            'fake_execute_key_server = zed_aruco.fake_execute_key_server:main'
+            'fake_execute_key_server = zed_aruco.fake_execute_key_server:main',
+            'joint_state_bridge = zed_aruco.joint_state_bridge:main'
         ],
     },
 )

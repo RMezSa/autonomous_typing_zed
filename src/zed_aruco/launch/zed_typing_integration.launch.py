@@ -111,6 +111,13 @@ def generate_launch_description():
         }]
     )
 
+    joint_state_bridge = Node(
+        package='zed_aruco',
+        executable='joint_state_bridge',
+        name='joint_state_bridge',
+        output='screen',
+    )
+
     static_tf_publisher = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -191,6 +198,7 @@ def generate_launch_description():
         static_tf_pitch_arg,
         static_tf_yaw_arg,
         zed_combined,
+        joint_state_bridge,
         static_tf_publisher,
         coordinator,
         calibration_probe,

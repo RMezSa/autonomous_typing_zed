@@ -40,7 +40,7 @@ Packages and main nodes:
 ```mermaid
 graph LR
   ZED["zed_wrapper (external)\nZED camera node"] -->|"/zed2i/zed_node/rgb/color/rect/image\nsensor_msgs/Image"| ZED_ARUCO["zed_aruco_node"]
-  ZED -->|"/zed2i/zed_node/rgb/color/rect/camera_info\nsensor_msgs/CameraInfo"| ZED_ARUCO
+  ZED -->|"/zed2i/zed_node/rgb/camera_info\nsensor_msgs/CameraInfo"| ZED_ARUCO
 
   ZED_ARUCO -->|"/aruco_markers_3d\nvisualization_msgs/MarkerArray"| RVIZ["viz/debug"]
   ZED_ARUCO -->|"/aruco_debug_image\nsensor_msgs/Image"| RVIZ
@@ -84,7 +84,6 @@ graph LR
 | zed_aruco_node.aruco_dictionary | DICT_4X4_50 | ArUco dictionary. |
 | zed_aruco_node.target_key_label | "" | Force a specific key label (if used). |
 | zed_aruco_node.homography_hold_seconds | 1.0 | Homography persistence after marker loss. |
-| zed_aruco_node.pose_selection_strategy | reprojection_error | Pose selection strategy (or plane_normal). |
 | zed_aruco_node.marker_ref_is_bottom_right | false | Marker reference corner (OpenCV default TL). |
 | typing_coordinator.action_name | /arm_ik/execute_key | Arm action server. |
 | typing_coordinator.done_topic | keyboard/mark_done | Key completion signal. |
@@ -93,7 +92,7 @@ graph LR
 | typing_coordinator.target_pitch | -75.0 | Target pitch (deg). |
 | typing_coordinator.min_confidence | 0.3 | Minimum target confidence. |
 | typing_coordinator.required_state | TRACKING | Required state before moving. |
-| typing_coordinator.goal_cooldown_sec | 0.3 | Cooldown between goals. |
+| typing_coordinator.goal_cooldown_sec | (fixed) | Cooldown between goals (constant in code). |
 | typing_coordinator.accept_dry_run_result | false | Accept dry-run results as success. |
 | typing_coordinator.use_tf_targeting | true | Use TF (camera->arm) for mapping. |
 | typing_coordinator.arm_base_frame | arm_base | Arm base frame. |
@@ -102,7 +101,6 @@ graph LR
 | typing_coordinator.camera_fx/fy | 700.0 | Camera intrinsics. |
 | typing_coordinator.camera_cx/cy | 640.0 / 360.0 | Optical center (px). |
 | typing_coordinator.arm_z_offset | 0.0 | Extra Z offset (m). |
-| typing_coordinator.workspace_* | x:[-0.10,0.55], y:[-0.55,0.55], z:[0.02,0.80] | Workspace bounds. |
 | typing_coordinator.motion_enabled | false | Safety gate for motion. |
 | typing_coordinator.require_transform_valid | true | Require valid TF before moving. |
 | typing_coordinator.servo_mode_enabled | false | Enable continuous YZ servo + press/retract (vertical panel). |
@@ -110,20 +108,22 @@ graph LR
 | typing_coordinator.emergency_stop_topic | keyboard/emergency_stop | Immediate hold (no retract). |
 | typing_coordinator.servo_y_gain_m_per_px | 0.00035 | Horizontal pixel error → arm-y gain. |
 | typing_coordinator.servo_z_gain_m_per_px | 0.00035 | Vertical pixel error → arm-z gain. |
+| typing_coordinator.servo_ki_y_per_px_per_s | 0.0001 | Integral gain for Y (PI alignment). |
+| typing_coordinator.servo_ki_z_per_px_per_s | 0.0001 | Integral gain for Z (PI alignment). |
+| typing_coordinator.servo_deadband_px | 4.0 | PI deadband (px). |
 | typing_coordinator.servo_xy_step_max_m | 0.003 | Max YZ step per update. |
 | typing_coordinator.servo_align_enter/exit_thresh_px | 8.0 / 12.0 | Alignment hysteresis. |
-| typing_coordinator.servo_align_stable_cycles | 4 | Stable cycles before press. |
-| typing_coordinator.servo_cmd_cooldown_sec | 0.08 | Servo command cooldown. |
+| typing_coordinator.servo_align_stable_cycles | (fixed) | Stable cycles before press (constant in code). |
+| typing_coordinator.servo_cmd_cooldown_sec | (fixed) | Servo command cooldown (constant in code). |
 | typing_coordinator.servo_press_step_m | 0.0015 | Press step along arm-x (into panel). |
 | typing_coordinator.servo_press_max_travel_m | 0.015 | Max press travel along arm-x. |
 | typing_coordinator.servo_press_timeout_sec | 2.0 | Press timeout. |
 | typing_coordinator.servo_press_direction_sign | +1.0 | +1.0 presses into panel (+arm-x). |
 | typing_coordinator.servo_retract_step_m | 0.0025 | Retract step along arm-x back to hover. |
-| typing_coordinator.return_to_base_* | enabled=true, on_failure=true, command=KEYBOARD_HOME | Return-to-base behavior. |
+| typing_coordinator.return_to_base_command | INTERMEDIATE | Predefined pose name for return-to-base. |
 | typing_coordinator.debug_publish_period_sec | 0.25 | Debug publish period (s). |
 | typing_coordinator.image_center_x/y | 640.0 / 360.0 | Image center for heuristic mapping. |
 | typing_coordinator.base_x/base_y | 0.25 / 0.0 | Vertical-panel mapping: base_x = panel-face arm-x; base_y = arm-y at horizontal center. |
-| typing_coordinator.target_z | 0.12 | Vertical-panel mapping: arm-z at the keyboard top reference pixel. |
 | typing_coordinator.scale_y_per_px | 0.00035 | Horizontal px → arm-y scale. |
 | typing_coordinator.scale_z_per_px | 0.00035 | Vertical px → arm-z scale. |
 | calibration_probe.arm_base_frame | arm_base | Arm base frame for TF. |
@@ -135,7 +135,7 @@ graph LR
 | fake_execute_key_server.result_mode | success | Simulated action result mode. |
 | fake_execute_key_server.delay_sec | 0.2 | Simulated action delay. |
 | arm_node.publish_on_action | false | Publish joints only if action allows. |
-| aruco_py.aruco_advanced.yaml (template) | (see file) | Advanced ArUco parameter set (node must consume). |
+| aruco_py.aruco_advanced.yaml (template) | (see file) | Standalone detector tuning template for `aruco_py`. |
 
 Timers / rates:
 - typing_coordinator.tick: 0.1s (10 Hz)

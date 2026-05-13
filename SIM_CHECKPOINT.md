@@ -23,10 +23,10 @@ when given a manual contact pulse.
 ### 1. `src/arm_ik/src/main.cpp` — IK joint mapping
 Removed an unjustified `-90°` offset on q4. Final mapping:
 ```cpp
-q1d = -radToDeg(q1);
-q2d = -radToDeg(q2) + 90.0;   // q2 absorbs the URDF rest-pose offset (+Z vs +X)
-q3d = -radToDeg(q3);
-q4d = -radToDeg(q4);          // no offset — q4 measures relative to forearm
+q1d = radToDeg(q1);
+q2d = radToDeg(q2);
+q3d = radToDeg(q3);
+q4d = radToDeg(q4);
 q5d = radToDeg(q5);
 ```
 
@@ -102,7 +102,6 @@ ros2 run zed_aruco typing_coordinator --ros-args \
   -p base_y:=0.0 \
   -p target_z:=0.35 \
   -p target_pitch:=0.0 \
-  -p goal_cooldown_sec:=2.0 \
   -p workspace_x_max:=1.0 \
   -p image_center_x:=520.0 \
   -p image_center_y:=180.0 \
@@ -129,13 +128,11 @@ ros2 run zed_aruco typing_coordinator --ros-args \
   -p scale_z_per_px:=0.0004 \
   -p servo_align_enter_thresh_px:=500.0 \
   -p servo_align_exit_thresh_px:=600.0 \
-  -p servo_align_stable_cycles:=2 \
   -p return_to_base_command:=HOME \
   -p servo_press_step_m:=0.0005 \
   -p servo_press_max_travel_m:=0.05 \
   -p servo_press_timeout_sec:=15.0 \
   -p servo_press_xy_scale:=0.0 \
-  -p return_to_base_wait_sec:=1.5
 ```
 
 Why these servo overrides are sim-only (do **not** carry to hardware):
@@ -143,6 +140,10 @@ Why these servo overrides are sim-only (do **not** carry to hardware):
 - `servo_press_xy_scale:=0.0` — disables YZ correction during press. With fake vision, the constant pixel error would otherwise drive arm-z monotonically out of the workspace mid-press.
 - `return_to_base_command:=HOME` — uses the unconditional URDF `HOME` predefined pose so we don't have to call `SET_KEYBOARD_HOME` first.
 - Slow press tuning (`servo_press_step_m:=0.0005`, `_max_travel:=0.05`, `_timeout:=15.0`) — extends the `PRESSING` window to ~8 s so the manual contact pulse can land on time.
+
+Note: `goal_cooldown_sec`, `servo_align_stable_cycles`, and `return_to_base_wait_sec` are now
+constants in typing_coordinator and are no longer ROS parameters. Edit
+`zed_aruco/typing_coordinator.py` if these values need to change.
 
 ### Terminal 6 — debug watcher
 ```bash

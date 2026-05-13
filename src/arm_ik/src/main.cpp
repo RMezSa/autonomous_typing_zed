@@ -1,11 +1,13 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <typing_interfaces/action/execute_key.hpp>
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -29,6 +31,11 @@ class ArmNode : public rclcpp::Node {
         static constexpr double kInterpRateHz = 50.0;
         static constexpr double kTargetReachedTolDeg = 0.5;
         static constexpr double kJointStateStaleSec = 2.0;
+        // Arrival check on real joint feedback is looser than the commanded-pose tol because
+        // feedback has lag + quantization. The action will still time out if hardware never
+        // catches up, so this only affects how quickly "arrived" trips after the interp
+        // finishes ramping.
+        static constexpr double kArrivalFeedbackTolDeg = 2.0;
 
         ArmNode() : Node("arm_node") {
             pub_q1_ = this->create_publisher<std_msgs::msg::Float64>("arm_teleop/joint1", 1);
@@ -37,6 +44,7 @@ class ArmNode : public rclcpp::Node {
             pub_q4_ = this->create_publisher<std_msgs::msg::Float64>("arm_teleop/joint4", 1);
             pub_q5_ = this->create_publisher<std_msgs::msg::Int32>("arm_teleop/joint5", 1);
             debug_status_pub_ = this->create_publisher<std_msgs::msg::String>("/arm_ik/debug_status", 10);
+            at_target_pub_ = this->create_publisher<std_msgs::msg::Bool>("/arm_ik/at_target", 10);
 
             this->declare_parameter("publish_on_action", false);
             publish_on_action_ = this->get_parameter("publish_on_action").as_bool();
@@ -116,6 +124,11 @@ class ArmNode : public rclcpp::Node {
             return (v < lim[0] || v > lim[1]);
         }
 
+        static bool finiteAll(double a, double b, double c, double d, double e) {
+            return std::isfinite(a) && std::isfinite(b) && std::isfinite(c) &&
+                   std::isfinite(d) && std::isfinite(e);
+        }
+
         bool inverseKinematics(double x, double y, double z,
                                double rollRad, double pitchRad,
                                double &q1d, double &q2d, double &q3d, double &q4d, double &q5d) {
@@ -125,14 +138,23 @@ class ArmNode : public rclcpp::Node {
             const double l3 = 0.43;
             const double l4 = 0.213;
 
+            if (!finiteAll(x, y, z, rollRad, pitchRad)) return false;
+
             const double q1 = std::atan2(y, x);
             const double q5 = rollRad;
 
             const double a = std::sqrt(x*x + y*y) - l4 * std::cos(pitchRad);
             const double b = z - (l4 * std::sin(pitchRad)) - l1;
 
-            double d = (a*a + b*b - l2*l2 - l3*l3) / (2.0 * l2 * l3);
-            d = std::max(-1.0, std::min(1.0, d));
+            const double d_raw = (a*a + b*b - l2*l2 - l3*l3) / (2.0 * l2 * l3);
+            constexpr double kReachabilityEpsilon = 1e-6;
+            if (!std::isfinite(d_raw) ||
+                d_raw < -1.0 - kReachabilityEpsilon ||
+                d_raw > 1.0 + kReachabilityEpsilon) {
+                return false;
+            }
+
+            const double d = std::max(-1.0, std::min(1.0, d_raw));
 
             const double q3 = -std::atan2(std::sqrt(1.0 - d*d), d);
             const double q2 = std::atan2(b, a) - std::atan2(l3 * std::sin(q3), l2 + l3 * std::cos(q3));
@@ -180,15 +202,44 @@ class ArmNode : public rclcpp::Node {
     }
 
     void setTarget(double q1, double q2, double q3, double q4, double q5) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        target_deg_[0] = q1;
-        target_deg_[1] = q2;
-        target_deg_[2] = q3;
-        target_deg_[3] = q4;
-        target_deg_[4] = q5;
-        target_valid_ = true;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            target_deg_[0] = q1;
+            target_deg_[1] = q2;
+            target_deg_[2] = q3;
+            target_deg_[3] = q4;
+            target_deg_[4] = q5;
+            target_valid_ = true;
+        }
+        // New target invalidates the previous arrival latch. The interp tick will set it
+        // back to true once last_published_deg_ converges (and joint feedback agrees, when
+        // available).
+        at_target_.store(false, std::memory_order_release);
+        publishAtTarget(false);
     }
-    
+
+    // True when joint feedback is fresh and all fed joints are within
+    // kArrivalFeedbackTolDeg of `target`. Stale/missing feedback returns true so we fall
+    // back to commanded-pose arrival.
+    bool feedbackAgreesWithTarget(const std::array<double, 5>& target) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!joint_state_valid_) return true;
+        const double age = this->get_clock()->now().seconds() - last_joint_state_time_;
+        if (age < 0.0 || age >= kJointStateStaleSec) return true;
+        for (size_t i = 0; i < 5; ++i) {
+            if (!joint_state_index_valid_[i]) continue;
+            if (!std::isfinite(joint_state_deg_[i]) || !std::isfinite(target[i])) return false;
+            if (std::abs(joint_state_deg_[i] - target[i]) > kArrivalFeedbackTolDeg) return false;
+        }
+        return true;
+    }
+
+    void publishAtTarget(bool v) {
+        if (!at_target_pub_) return;
+        std_msgs::msg::Bool m;
+        m.data = v;
+        at_target_pub_->publish(m);
+    }
 
     // Steps last_published_deg_ toward target_deg_ with per-tick proportional clamping.
     // Proportional (not per-joint independent) preserves the joint-space straight line.
@@ -202,16 +253,31 @@ class ArmNode : public rclcpp::Node {
             last = last_published_deg_;
             valid = target_valid_;
         }
-        if (!valid) return;
+        if (!valid) {
+            publishAtTarget(at_target_.load(std::memory_order_acquire));
+            return;
+        }
 
         std::array<double, 5> delta{};
         double max_abs_delta = 0.0;
         for (size_t i = 0; i < 5; ++i) {
-            if (!std::isfinite(last[i]) || !std::isfinite(target[i])) return;
+            if (!std::isfinite(last[i]) || !std::isfinite(target[i])) {
+                publishAtTarget(at_target_.load(std::memory_order_acquire));
+                return;
+            }
             delta[i] = target[i] - last[i];
             max_abs_delta = std::max(max_abs_delta, std::abs(delta[i]));
         }
-        if (max_abs_delta < kTargetReachedTolDeg) return;
+        if (max_abs_delta < kTargetReachedTolDeg) {
+            // Commanded pose converged. Promote to "at_target" only if joint feedback
+            // confirms (or is unavailable/stale, in which case we trust the commanded
+            // pose).
+            if (feedbackAgreesWithTarget(target)) {
+                at_target_.store(true, std::memory_order_release);
+            }
+            publishAtTarget(at_target_.load(std::memory_order_acquire));
+            return;
+        }
 
         double ratio = 1.0;
         if (max_abs_delta > max_step_deg_per_tick_) {
@@ -229,30 +295,54 @@ class ArmNode : public rclcpp::Node {
             std::lock_guard<std::mutex> lock(state_mutex_);
             last_published_deg_ = next_q;
         }
+        publishAtTarget(false);
     }
 
     void onJointStates(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        // Partial joint sets are allowed: the bridge publishes joints 1..4 only
+        // (no feedback for the gripper servo). Indices missing from the message
+        // keep their previous cached value.
+        std::array<bool, 5> updated{false, false, false, false, false};
         std::array<double, 5> tmp{};
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            tmp = joint_state_deg_;
+        }
+
         for (size_t i = 0; i < 5; ++i) {
             auto it = std::find(msg->name.begin(), msg->name.end(), joint_state_names_[i]);
-            if (it == msg->name.end()) return;
+            if (it == msg->name.end()) continue;
             const size_t idx = static_cast<size_t>(it - msg->name.begin());
-            if (idx >= msg->position.size()) return;
+            if (idx >= msg->position.size()) continue;
             double v = msg->position[idx];
+            if (!std::isfinite(v)) continue;
             if (!joint_state_in_degrees_) v *= 180.0 / M_PI;
             tmp[i] = v;
+            updated[i] = true;
         }
+
+        bool any_updated = false;
+        for (size_t i = 0; i < 5; ++i) {
+            if (updated[i]) { any_updated = true; break; }
+        }
+        if (!any_updated) return;
 
         std::lock_guard<std::mutex> lock(state_mutex_);
         joint_state_deg_ = tmp;
+        for (size_t i = 0; i < 5; ++i) {
+            if (updated[i]) joint_state_index_valid_[i] = true;
+        }
         joint_state_valid_ = true;
         last_joint_state_time_ = this->get_clock()->now().seconds();
 
-        // Bootstrap: if we haven't accepted a target yet, snap last_published_ to the
-        // measured pose so the first commanded motion ramps from where the arm actually is,
-        // not from the (possibly wrong) `start_pose_deg` parameter.
+        // Bootstrap: snap last_published_ to the measured pose so the first commanded
+        // motion ramps from where the arm actually is. Only joints we have feedback
+        // for are updated; the rest keep their start_pose_deg default.
         if (!target_valid_) {
-            last_published_deg_ = tmp;
+            for (size_t i = 0; i < 5; ++i) {
+                if (updated[i]) last_published_deg_[i] = tmp[i];
+            }
         }
     }
 
@@ -277,6 +367,7 @@ class ArmNode : public rclcpp::Node {
         std::array<double, 5> last;
         std::array<double, 5> target;
         std::array<double, 5> js;
+        std::array<bool, 5> js_idx_valid;
         bool t_valid, js_valid;
         double js_time;
         {
@@ -284,6 +375,7 @@ class ArmNode : public rclcpp::Node {
             last = last_published_deg_;
             target = target_deg_;
             js = joint_state_deg_;
+            js_idx_valid = joint_state_index_valid_;
             t_valid = target_valid_;
             js_valid = joint_state_valid_;
             js_time = last_joint_state_time_;
@@ -297,6 +389,7 @@ class ArmNode : public rclcpp::Node {
         if (js_fresh) {
             tracking_err = 0.0;
             for (size_t i = 0; i < 5; ++i) {
+                if (!js_idx_valid[i]) continue;
                 if (!std::isfinite(last[i]) || !std::isfinite(js[i])) {
                     tracking_err = -1.0;
                     break;
@@ -336,6 +429,7 @@ class ArmNode : public rclcpp::Node {
            << "\"roll\":" << groll_ << ","
            << "\"pitch\":" << gpitch_ << "},"
            << "\"keyboard_home_set\":" << (kb_home_set_ ? "true" : "false") << ","
+           << "\"joint_keyboard_home_set\":" << (kb_home_joints_set_ ? "true" : "false") << ","
            << "\"max_step_deg_per_tick\":" << max_step_deg_per_tick_ << ","
            << "\"target_valid\":" << (t_valid ? "true" : "false") << ","
            << "\"max_remaining_deg\":" << max_remaining << ","
@@ -344,7 +438,8 @@ class ArmNode : public rclcpp::Node {
            << "\"joint_state_valid\":" << (js_valid ? "true" : "false") << ","
            << "\"joint_state_age_sec\":" << js_age << ","
            << "\"joint_state_fresh\":" << (js_fresh ? "true" : "false") << ","
-           << "\"tracking_error_max_deg\":" << tracking_err
+           << "\"tracking_error_max_deg\":" << tracking_err << ","
+           << "\"at_target\":" << (at_target_.load(std::memory_order_acquire) ? "true" : "false")
            << "}";
 
         std_msgs::msg::String msg;
@@ -364,6 +459,9 @@ class ArmNode : public rclcpp::Node {
     double kb_home_z_ = 0.35;
     double kb_home_roll_ = 0.0;
     double kb_home_pitch_ = 0.0;
+
+    bool kb_home_joints_set_ = false;
+    std::array<double, 5> kb_home_joints_{0.0, 0.0, 0.0, 0.0, 0.0};
 
     static inline bool isNan(double v) {
         return std::isnan(v);
@@ -413,6 +511,60 @@ class ArmNode : public rclcpp::Node {
             last_command_source_ = "topic:/predefined";
             last_ik_ok_ = true;
             last_ik_message_ = "keyboard_home_captured";
+            last_command_time_sec_ = this->get_clock()->now().seconds();
+            return;
+        }
+
+        // Joint-space variant. Snapshots the measured joint angles for joints 1..4
+        // (from the bridge) and the last commanded joint5 (no feedback for the gripper).
+        // Replay (KEYBOARD_HOME_JOINTS) bypasses IK and commands those joints directly —
+        // exact pose reproducibility, no IK branch ambiguity.
+        if (p == "SET_KEYBOARD_HOME_JOINTS" || p == "SET_KB_HOME_JOINTS") {
+            std::array<double, 5> snapshot{};
+            std::array<bool, 5> idx_valid;
+            bool js_ok;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                js_ok = joint_state_valid_;
+                snapshot = joint_state_deg_;
+                idx_valid = joint_state_index_valid_;
+                snapshot[4] = last_published_deg_[4];
+            }
+            if (!js_ok || !(idx_valid[0] && idx_valid[1] && idx_valid[2] && idx_valid[3])) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Cannot set joint-space keyboard home: joints 1..4 feedback not yet received on /joint_states.");
+                return;
+            }
+            kb_home_joints_ = snapshot;
+            kb_home_joints_set_ = true;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Joint keyboard home captured: [%.2f, %.2f, %.2f, %.2f, %.2f] deg",
+                kb_home_joints_[0], kb_home_joints_[1], kb_home_joints_[2],
+                kb_home_joints_[3], kb_home_joints_[4]
+            );
+            last_predefined_ = p;
+            last_command_source_ = "topic:/predefined";
+            last_ik_ok_ = true;
+            last_ik_message_ = "joint_keyboard_home_captured";
+            last_command_time_sec_ = this->get_clock()->now().seconds();
+            return;
+        }
+
+        if (p == "KEYBOARD_HOME_JOINTS" || p == "KB_HOME_JOINTS") {
+            if (!kb_home_joints_set_) {
+                RCLCPP_WARN(this->get_logger(),
+                    "Joint keyboard home not set. Send SET_KEYBOARD_HOME_JOINTS first.");
+                return;
+            }
+            setTarget(kb_home_joints_[0], kb_home_joints_[1], kb_home_joints_[2],
+                      kb_home_joints_[3], kb_home_joints_[4]);
+            last_predefined_ = p;
+            last_command_source_ = "topic:/predefined";
+            last_ik_ok_ = true;
+            last_ik_message_ = "joint_keyboard_home_target_set";
             last_command_time_sec_ = this->get_clock()->now().seconds();
             return;
         }
@@ -487,6 +639,16 @@ class ArmNode : public rclcpp::Node {
         groll_ = goal->roll; gpitch_ = goal->pitch;
         const bool ok = runIKAndPublish(goal->x, goal->y, goal->z, goal->roll, goal->pitch, publish_on_action_);
 
+        if (!ok) {
+            result->success = false;
+            result->message = "IK failed for requested goal";
+            last_ik_ok_ = false;
+            last_ik_message_ = "ik_failed_action_goal";
+            last_action_result_ = result->message;
+            goal_handle->abort(result);
+            return;
+        }
+
         if (goal_handle->is_canceling()) {
             result->success = false;
             result->message = "Cancelled";
@@ -495,23 +657,75 @@ class ArmNode : public rclcpp::Node {
             return;
         }
 
+        // Dry-run: no joints were published, so there's nothing to wait for.
+        if (!publish_on_action_) {
+            feedback->stage = "done";
+            feedback->progress = 1.0f;
+            goal_handle->publish_feedback(feedback);
+            result->success = true;
+            result->message = "IK solved (dry-run, no publish)";
+            last_action_result_ = result->message;
+            goal_handle->succeed(result);
+            return;
+        }
+
+        // Wait for physical arrival before declaring success. The interp loop sets
+        // at_target_ true once last_published_deg_ converges and (when feedback is fresh)
+        // joint_state_deg_ agrees within kArrivalFeedbackTolDeg.
+        constexpr auto kArrivalTimeout = std::chrono::milliseconds(8000);
+        constexpr auto kPollPeriod = std::chrono::milliseconds(50);
+        constexpr auto kFeedbackPeriod = std::chrono::milliseconds(200);
+
+        const auto wait_start = std::chrono::steady_clock::now();
+        auto next_feedback = wait_start;
+        bool arrived = false;
+        bool cancelled = false;
+
+        while (rclcpp::ok()) {
+            if (goal_handle->is_canceling()) { cancelled = true; break; }
+            if (at_target_.load(std::memory_order_acquire)) { arrived = true; break; }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now - wait_start >= kArrivalTimeout) break;
+
+            if (now >= next_feedback) {
+                const double elapsed_s = std::chrono::duration<double>(now - wait_start).count();
+                const double timeout_s = std::chrono::duration<double>(kArrivalTimeout).count();
+                const double frac = std::min(1.0, elapsed_s / timeout_s);
+                feedback->stage = "moving";
+                feedback->progress = 0.5f + 0.45f * static_cast<float>(frac);
+                goal_handle->publish_feedback(feedback);
+                next_feedback = now + kFeedbackPeriod;
+            }
+
+            std::this_thread::sleep_for(kPollPeriod);
+        }
+
+        if (cancelled) {
+            result->success = false;
+            result->message = "Cancelled";
+            last_action_result_ = "cancelled";
+            goal_handle->canceled(result);
+            return;
+        }
+
+        if (!arrived) {
+            result->success = false;
+            result->message = "Arm did not reach target within timeout";
+            last_ik_message_ = "arrival_timeout";
+            last_action_result_ = result->message;
+            goal_handle->abort(result);
+            return;
+        }
+
         feedback->stage = "done";
         feedback->progress = 1.0f;
         goal_handle->publish_feedback(feedback);
 
-        if (ok) {
-            result->success = true;
-            result->message = publish_on_action_ ? "IK solved and command published" : "IK solved (dry-run, no publish)";
-            last_action_result_ = result->message;
-            goal_handle->succeed(result);
-        } else {
-            result->success = false;
-            result->message = "IK failed for requested goal";
-            last_ik_ok_ = false;
-            last_ik_message_ = "ik_failed_action_goal";
-            last_action_result_ = result->message;
-            goal_handle->abort(result);
-        }
+        result->success = true;
+        result->message = "Arm reached target";
+        last_action_result_ = result->message;
+        goal_handle->succeed(result);
     }
 
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_q1_;
@@ -520,6 +734,7 @@ class ArmNode : public rclcpp::Node {
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_q4_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr pub_q5_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr debug_status_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr at_target_pub_;
 
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_goal_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_predefined_;
@@ -543,8 +758,15 @@ class ArmNode : public rclcpp::Node {
     bool target_valid_{false};
     double max_step_deg_per_tick_{1.5};
 
+    // Arrival latch. True at startup (nothing pending). Cleared by setTarget(); set by
+    // tickInterpolator() once commanded pose has converged and joint feedback agrees
+    // (or feedback is unavailable/stale). Used by the action thread and exposed on
+    // /arm_ik/at_target for the typing_coordinator's RETURNING_BASE phase.
+    std::atomic<bool> at_target_{true};
+
     // Joint-state feedback state.
     std::array<double, 5> joint_state_deg_{0.0, 0.0, 0.0, 0.0, 0.0};
+    std::array<bool, 5> joint_state_index_valid_{false, false, false, false, false};
     bool joint_state_valid_{false};
     double last_joint_state_time_{0.0};
     std::vector<std::string> joint_state_names_;

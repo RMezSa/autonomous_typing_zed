@@ -11,19 +11,26 @@ def generate_launch_description():
     # Package path
     zed_aruco_pkg = FindPackageShare('zed_aruco')
 
-    # Declare arguments
+    # Declare arguments. Defaults match the canonical ZED2i rectified RGB topic
+    # used by the rest of the launchers (zed_combined / zed_typing_integration).
     image_topic_arg = DeclareLaunchArgument(
         'image_topic',
-        default_value='/zed2i/zed_node/left/image_rect_color',
+        default_value='/zed2i/zed_node/rgb/color/rect/image',
         description='Image topic to subscribe to'
     )
-    
+
+    camera_info_topic_arg = DeclareLaunchArgument(
+        'camera_info_topic',
+        default_value='/zed2i/zed_node/rgb/camera_info',
+        description='CameraInfo topic published by the ZED ROS 2 wrapper'
+    )
+
     marker_size_arg = DeclareLaunchArgument(
         'marker_size',
         default_value='0.1',
         description='Size of the ArUco marker in meters'
     )
-    
+
     dictionary_arg = DeclareLaunchArgument(
         'aruco_dictionary',
         default_value='DICT_4X4_50',
@@ -33,7 +40,7 @@ def generate_launch_description():
     # Launch the ZED node if requested (optional)
     # By default, we assume it's already running or launched separately
     # But we can include it here for convenience if the user wants.
-    
+
     # ArUco detection node
     aruco_node = Node(
         package='zed_aruco',
@@ -41,14 +48,16 @@ def generate_launch_description():
         name='zed_aruco_node',
         parameters=[{
             'image_topic': LaunchConfiguration('image_topic'),
+            'camera_info_topic': LaunchConfiguration('camera_info_topic'),
             'marker_size': LaunchConfiguration('marker_size'),
             'aruco_dictionary': LaunchConfiguration('aruco_dictionary')
         }],
         output='screen'
     )
-    
+
     return LaunchDescription([
         image_topic_arg,
+        camera_info_topic_arg,
         marker_size_arg,
         dictionary_arg,
         aruco_node,

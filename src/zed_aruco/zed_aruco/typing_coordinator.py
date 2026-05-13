@@ -23,7 +23,15 @@ _INTEGRAL_CLAMP_M = 0.005       # max ±meters the integral term can ever comman
 _GOAL_COOLDOWN_SEC = 0.3        # min interval between ExecuteKey action goals
 _SERVO_CMD_COOLDOWN_SEC = 0.08  # min interval between servo /goal publishes (≈12.5 Hz)
 _SERVO_ALIGN_STABLE_CYCLES = 4  # consecutive ticks within enter-threshold before alignment latches
-_RETURN_TO_BASE_WAIT_SEC = 1.0  # how long RETURNING_BASE blocks before allowing next key
+# Minimum dwell after publishing the return command before we'll accept arm_node's
+# at_target=true as the "we got there" signal. Prevents racing on a stale at_target
+# message that arm_node sent before it had processed our new /predefined command.
+_RETURN_TO_BASE_GRACE_SEC = 0.3
+# Hard timeout for RETURNING_BASE. If at_target never goes true (e.g. arm_node not
+# running, or hardware stuck), we still advance after this many seconds so the typing
+# loop doesn't hang. Sized larger than the worst-case interp travel
+# (5 joints × ~270° / 75°·s⁻¹ ≈ 4 s ceiling) plus margin.
+_RETURN_TO_BASE_TIMEOUT_SEC = 6.0
 
 
 class TypingCoordinator(Node):
@@ -162,6 +170,13 @@ class TypingCoordinator(Node):
         self.create_subscription(Bool, self.contact_topic, self.on_contact, 10)
         self.create_subscription(Bool, self.emergency_stop_topic, self.on_emergency_stop, 10)
         self.create_subscription(Float32, plane_z_topic, self.on_plane_z, 10)
+        # arm_node publishes /arm_ik/at_target whenever the interpolator ticks: true once
+        # last_published_deg_ has converged and joint feedback agrees. RETURNING_BASE
+        # waits for this instead of a fixed sleep, so we don't advance to the next key
+        # while the arm is still in transit on long moves (HOME, PREFLOOR, etc.).
+        self.arm_at_target = False
+        self.arm_at_target_msg_time = 0.0
+        self.create_subscription(Bool, '/arm_ik/at_target', self.on_arm_at_target, 10)
 
         camera_info_topic = str(self.get_parameter('camera_info_topic').value)
         self.camera_info_received = False
@@ -250,6 +265,10 @@ class TypingCoordinator(Node):
 
     def on_contact(self, msg: Bool):
         self.contact_pressed = bool(msg.data)
+
+    def on_arm_at_target(self, msg: Bool):
+        self.arm_at_target = bool(msg.data)
+        self.arm_at_target_msg_time = self.get_clock().now().nanoseconds * 1e-9
 
     def on_plane_z(self, msg: Float32):
         self.measured_plane_z = float(msg.data)
@@ -674,10 +693,33 @@ class TypingCoordinator(Node):
             self.command_return_to_base()
             self.servo_return_start_time = now_sec
             self.servo_return_started = True
+            # Force a re-check edge: any at_target=true received before now is stale (it
+            # reflects the pre-command pose, not the return target).
+            self.arm_at_target = False
             return
 
-        if (now_sec - self.servo_return_start_time) < _RETURN_TO_BASE_WAIT_SEC:
+        elapsed = now_sec - self.servo_return_start_time
+
+        # Wait the grace window before trusting at_target. After the grace, advance as
+        # soon as arm_node reports at_target with a fresh message; if the timeout fires
+        # first, advance anyway and log so the operator sees what happened.
+        if elapsed < _RETURN_TO_BASE_GRACE_SEC:
             return
+
+        arrival_signal = (
+            self.arm_at_target
+            and self.arm_at_target_msg_time >= (self.servo_return_start_time + _RETURN_TO_BASE_GRACE_SEC)
+        )
+        timed_out = elapsed >= _RETURN_TO_BASE_TIMEOUT_SEC
+
+        if not arrival_signal and not timed_out:
+            return
+
+        if timed_out and not arrival_signal:
+            self.get_logger().warn(
+                f"RETURNING_BASE timeout after {elapsed:.2f}s without at_target=true; "
+                "advancing anyway. Check that arm_node is publishing /arm_ik/at_target."
+            )
 
         self.servo_return_started = False
         self.servo_return_start_time = 0.0

@@ -47,10 +47,15 @@ def generate_launch_description():
         }.items()
     )
     
-    # ArUco detection node
-    # Try the rgb/color/rect/image which was seen in your logs
+    # ArUco detection node.
+    # ZED ROS 2 wrapper publishes the rectified RGB image at .../zed_node/rgb/color/rect/image
+    # and the matching camera_info at .../zed_node/rgb/camera_info — one level up, not at
+    # .../rgb/color/rect/camera_info. Pass both explicitly so the node doesn't have to guess.
     image_topic_expr = PythonExpression([
         "'/' + '", LaunchConfiguration('camera_name'), "' + '/zed_node/rgb/color/rect/image'"
+    ])
+    camera_info_topic_expr = PythonExpression([
+        "'/' + '", LaunchConfiguration('camera_name'), "' + '/zed_node/rgb/camera_info'"
     ])
 
     aruco_node = Node(
@@ -59,6 +64,7 @@ def generate_launch_description():
         name='zed_aruco_node',
         parameters=[{
             'image_topic': image_topic_expr,
+            'camera_info_topic': camera_info_topic_expr,
             'marker_size': LaunchConfiguration('marker_size'),
             'aruco_dictionary': LaunchConfiguration('aruco_dictionary')
         }],
