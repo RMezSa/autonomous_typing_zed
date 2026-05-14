@@ -7,11 +7,73 @@ import json
 from std_msgs.msg import String, Bool, Float32, Float64MultiArray
 from sensor_msgs.msg import CameraInfo
 from geometry_msgs.msg import PointStamped
+from rcl_interfaces.msg import SetParametersResult
 
 from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_geometry_msgs import do_transform_point
 
 from typing_interfaces.action import ExecuteKey
+
+
+# Calibration/mapping params: changing any of these invalidates the cached servo
+# command pose (which was computed from the old base_x/base_y/target_z/scales), so
+# the live-param callback also clears servo_cmd_initialized and resets the PI loop.
+_CALIBRATION_PARAMS = frozenset({
+    'base_x', 'base_y', 'target_z', 'target_pitch',
+    'scale_y_per_px', 'scale_z_per_px',
+})
+
+# Live-tunable params: (attr_name, expected_python_type). The callback writes the
+# new value into the matching self.* field so the next tick observes it.
+_HOT_RELOAD_PARAMS = {
+    'motion_enabled': ('motion_enabled', bool),
+    'require_transform_valid': ('require_transform_valid', bool),
+    'accept_dry_run_result': ('accept_dry_run_result', bool),
+    'use_tf_targeting': ('use_tf_targeting', bool),
+    'min_confidence': ('min_confidence', float),
+    'required_state': ('required_state', str),
+    'arm_base_frame': ('arm_base_frame', str),
+    'camera_frame': ('camera_frame', str),
+    'target_roll': ('target_roll', float),
+    'keyboard_plane_z_m': ('keyboard_plane_z_m', float),
+    'camera_fx': ('camera_fx', float),
+    'camera_fy': ('camera_fy', float),
+    'camera_cx': ('camera_cx', float),
+    'camera_cy': ('camera_cy', float),
+    'arm_z_offset': ('arm_z_offset', float),
+    'servo_z_gain_m_per_px': ('servo_z_gain', float),
+    'servo_y_gain_m_per_px': ('servo_y_gain', float),
+    'servo_ki_y_per_px_per_s': ('servo_ki_y', float),
+    'servo_ki_z_per_px_per_s': ('servo_ki_z', float),
+    'servo_deadband_px': ('servo_deadband_px', float),
+    'servo_xy_step_max_m': ('servo_xy_step_max', float),
+    'servo_align_enter_thresh_px': ('servo_align_enter_thresh_px', float),
+    'servo_align_exit_thresh_px': ('servo_align_exit_thresh_px', float),
+    'servo_press_step_m': ('servo_press_step_m', float),
+    'servo_press_max_travel_m': ('servo_press_max_travel_m', float),
+    'servo_press_timeout_sec': ('servo_press_timeout_sec', float),
+    'servo_press_direction_sign': ('servo_press_direction_sign', float),
+    'servo_press_xy_scale': ('servo_press_xy_scale', float),
+    'servo_retract_step_m': ('servo_retract_step_m', float),
+    'return_to_base_command': ('return_to_base_command', str),
+    'image_center_x': ('image_center_x', float),
+    'image_center_y': ('image_center_y', float),
+    # Calibration set — same machinery, side effect handled in the callback.
+    'base_x': ('base_x', float),
+    'base_y': ('base_y', float),
+    'target_z': ('target_z', float),
+    'target_pitch': ('target_pitch', float),
+    'scale_y_per_px': ('scale_y_per_px', float),
+    'scale_z_per_px': ('scale_z_per_px', float),
+}
+
+# Frozen params: bound at startup (topic names, timer periods). Rejected loudly so
+# `ros2 param set` failure is visible instead of silently no-op.
+_FROZEN_PARAMS = frozenset({
+    'action_name', 'done_topic', 'contact_topic', 'servo_state_topic',
+    'emergency_stop_topic', 'keyboard_plane_z_topic', 'debug_status_topic',
+    'camera_info_topic', 'debug_publish_period_sec',
+})
 
 
 # Hardcoded tuning constants for the servo loop. These were ROS parameters in earlier
@@ -42,7 +104,7 @@ class TypingCoordinator(Node):
         self.declare_parameter('done_topic', 'keyboard/mark_done')
         self.declare_parameter('target_z', 0.12)
         self.declare_parameter('target_roll', 0.0)
-        self.declare_parameter('target_pitch', -75.0)
+        self.declare_parameter('target_pitch', 0.0)
         self.declare_parameter('min_confidence', 0.3) #minimal confidence
         self.declare_parameter('required_state', 'TRACKING')
         self.declare_parameter('accept_dry_run_result', False)
@@ -233,10 +295,88 @@ class TypingCoordinator(Node):
         self.create_timer(0.1, self.tick)
         self.create_timer(max(0.05, self.debug_publish_period_sec), self.publish_debug_status)
 
+        # Live parameter updates. Without this callback, `ros2 param set` updates the
+        # parameter store but the gate/calibration logic keeps reading the stale
+        # self.* fields captured at startup — so motion_enabled, base_x/base_y/target_z,
+        # and the documented bring-up sequence in RUNTIME_COMMANDS.md were silent no-ops.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         self.get_logger().info(
             f"typing_coordinator started (motion_enabled={self.motion_enabled}, "
             f"require_transform_valid={self.require_transform_valid}, servo_mode_enabled={self.servo_mode_enabled})"
         )
+
+    def _on_set_parameters(self, params):
+        calibration_dirty = False
+        applied = []
+
+        for p in params:
+            name = p.name
+            value = p.value
+
+            if name == 'servo_mode_enabled':
+                if not isinstance(value, bool):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"servo_mode_enabled must be bool, got {type(value).__name__}",
+                    )
+                if value != self.servo_mode_enabled and self.servo_phase not in ('IDLE', 'COMPLETE'):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=(
+                            f"servo_mode_enabled change rejected: current phase "
+                            f"'{self.servo_phase}' is not IDLE/COMPLETE. Wait for key "
+                            f"completion (or release emergency stop) before switching modes."
+                        ),
+                    )
+                self.servo_mode_enabled = value
+                applied.append((name, value))
+                continue
+
+            if name in _FROZEN_PARAMS:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        f"Parameter '{name}' is frozen at startup (binds a topic / timer). "
+                        f"Restart the node with the new value via launch arg or YAML."
+                    ),
+                )
+
+            if name in _HOT_RELOAD_PARAMS:
+                attr, expected_type = _HOT_RELOAD_PARAMS[name]
+                if expected_type is float and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    coerced = float(value)
+                elif expected_type is bool and isinstance(value, bool):
+                    coerced = value
+                elif expected_type is str and isinstance(value, str):
+                    coerced = value
+                else:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"{name} must be {expected_type.__name__}, got {type(value).__name__}",
+                    )
+                setattr(self, attr, coerced)
+                applied.append((name, coerced))
+                if name in _CALIBRATION_PARAMS:
+                    calibration_dirty = True
+                continue
+
+            # Unknown / not-ours (use_sim_time, qos_overrides.*, etc.) — pass through.
+
+        if calibration_dirty:
+            self.servo_cmd_initialized = False
+            self.reset_servo_pid_state()
+            self.get_logger().info(
+                "Calibration/mapping parameter changed; servo command pose will "
+                "re-init on next tick and PI state reset."
+            )
+
+        if applied:
+            self.get_logger().info(
+                "Live param update: " + ", ".join(f"{n}={v}" for n, v in applied)
+            )
+
+        return SetParametersResult(successful=True)
 
     def on_target_key(self, msg: String):
         previous_key = self.current_key

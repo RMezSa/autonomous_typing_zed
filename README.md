@@ -89,7 +89,7 @@ graph LR
 | typing_coordinator.done_topic | keyboard/mark_done | Key completion signal. |
 | typing_coordinator.target_z | 0.12 | Press target Z (m). |
 | typing_coordinator.target_roll | 0.0 | Target roll (deg). |
-| typing_coordinator.target_pitch | -75.0 | Target pitch (deg). |
+| typing_coordinator.target_pitch | 0.0 | Target pitch (deg). Vertical-panel geometry — horizontal gripper push. |
 | typing_coordinator.min_confidence | 0.3 | Minimum target confidence. |
 | typing_coordinator.required_state | TRACKING | Required state before moving. |
 | typing_coordinator.goal_cooldown_sec | (fixed) | Cooldown between goals (constant in code). |

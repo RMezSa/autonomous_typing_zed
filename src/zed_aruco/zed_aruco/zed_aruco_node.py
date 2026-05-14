@@ -444,6 +444,19 @@ class ZedArucoNode(Node):
             return
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         self.complete_current_key()
+        # Tear down the live target so vision stops advertising the just-completed key
+        # as a valid target every frame. Without this, the optical-flow lock (line ~655)
+        # keeps publishing keyboard/target_key=<old> and target_valid=True; the coordinator
+        # can re-press the same key once cooldown expires, and the autonomous next-key
+        # advancement gate (image_callback: `not self.key_track_active`) stalls until the
+        # tracker organically drifts off. Applies in both autonomous and single-key paths
+        # (complete_current_key short-circuits in single-key mode, so this is the only
+        # place the single-key target ever gets cleared).
+        self.target_key_label = ''
+        self.key_track_active = False
+        self.key_track_point = None
+        self.key_track_lost = 0
+        self.target_kf_initialized = False
         self.typing_cooldown_until = now_sec + self.typing_cooldown_duration
 
     def type_word_callback(self, msg):
