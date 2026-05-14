@@ -105,7 +105,7 @@ Use `/predefined` or `/goal` to position the fingertip directly on that key:
 
 ```bash
 ros2 topic pub /goal std_msgs/msg/Float64MultiArray \
-  "{data: [0.35, 0.0, 0.30, 0.0, -75.0]}" --once
+  "{data: [0.35, 0.0, 0.30, 0.0, 0.0]}" --once
 # Then nudge with more /goal messages until the tip is exactly on the center key.
 ```
 

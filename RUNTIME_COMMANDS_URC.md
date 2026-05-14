@@ -52,16 +52,16 @@ ros2 topic echo /keyboard/coordinator_debug
 
 ```bash
 # Move arm near keyboard center
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.0, 0.15, 0.0, -75.0]}" --once
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.0, 0.15, 0.0, 0.0]}" --once
 
 # Mover más hacia adelante (x aumenta)
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.35, 0.0, 0.15, 0.0, -75.0]}" --once
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.35, 0.0, 0.15, 0.0, 0.0]}" --once
 
 # Mover a la izquierda (y positivo)
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.05, 0.15, 0.0, -75.0]}" --once
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.05, 0.15, 0.0, 0.0]}" --once
 
 # Subir (z aumenta)
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.0, 0.20, 0.0, -75.0]}" --once
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.30, 0.0, 0.20, 0.0, 0.0]}" --once
 
 # Read current arm target
 ros2 topic echo /arm_ik/debug_status --once

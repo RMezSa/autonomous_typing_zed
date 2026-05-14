@@ -94,6 +94,11 @@ _RETURN_TO_BASE_GRACE_SEC = 0.3
 # loop doesn't hang. Sized larger than the worst-case interp travel
 # (5 joints × ~270° / 75°·s⁻¹ ≈ 4 s ceiling) plus margin.
 _RETURN_TO_BASE_TIMEOUT_SEC = 6.0
+# Maximum consecutive press failures on the same key before halting. After this
+# many attempts without a successful press, motion_enabled is set to False and the
+# operator must inspect the cause (occlusion, contact wiring, alignment) and re-arm.
+# Prevents an infinite re-align loop that would burn motors and competition time.
+_MAX_PRESS_ATTEMPTS_PER_KEY = 3
 
 
 class TypingCoordinator(Node):
@@ -138,8 +143,8 @@ class TypingCoordinator(Node):
         self.declare_parameter('servo_ki_z_per_px_per_s', 0.0001)
         self.declare_parameter('servo_deadband_px', 4.0)
         self.declare_parameter('servo_xy_step_max_m', 0.003)
-        self.declare_parameter('servo_align_enter_thresh_px', 8.0)
-        self.declare_parameter('servo_align_exit_thresh_px', 12.0)
+        self.declare_parameter('servo_align_enter_thresh_px', 12.0)
+        self.declare_parameter('servo_align_exit_thresh_px', 20.0)
         self.declare_parameter('servo_press_step_m', 0.0015)
         self.declare_parameter('servo_press_max_travel_m', 0.015)
         self.declare_parameter('servo_press_timeout_sec', 2.0)
@@ -283,6 +288,11 @@ class TypingCoordinator(Node):
         self.last_goal_result = 'none'
         self.last_goal_result_message = ''
 
+        # Per-key press-failure counter. Reset when current_key changes to a new
+        # non-empty key; incremented when RETURNING_BASE exits with succeeded=False.
+        self.servo_press_attempts = 0
+        self.servo_press_attempts_key = ''
+
         # PI state for the YZ alignment loop. Reset on new key and on phase enter to
         # ALIGNING. Components last_p/i are cached for debug exposure only.
         self.servo_pid_integral_y = 0.0
@@ -379,16 +389,35 @@ class TypingCoordinator(Node):
         return SetParametersResult(successful=True)
 
     def on_target_key(self, msg: String):
+        incoming_key = msg.data.strip()
         previous_key = self.current_key
-        self.current_key = msg.data.strip()
-        if self.current_key != previous_key:
-            self.blocked_key = ''
-            self.servo_cmd_initialized = False
-            self.servo_aligned_cycles = 0
-            self.servo_cmd_key = ''
-            self.servo_press_succeeded = False
-            self.reset_servo_pid_state()
-            self.set_servo_phase('IDLE')
+        if incoming_key == previous_key:
+            return
+
+        # If we're mid-motion, ignore the transient key change and keep the active
+        # key/phase state stable until the arm has retracted/returned.
+        if self.servo_phase in ('PRESSING', 'RETRACTING', 'RETURNING_BASE'):
+            self.get_logger().warn(
+                f"target_key changed mid-motion ({previous_key!r} -> {incoming_key!r}, "
+                f"phase={self.servo_phase}); ignoring until motion completes."
+            )
+            return
+
+        self.current_key = incoming_key
+        self.blocked_key = ''
+        self.servo_cmd_initialized = False
+        self.servo_aligned_cycles = 0
+        self.servo_cmd_key = ''
+        self.servo_press_succeeded = False
+        self.reset_servo_pid_state()
+
+        # Reset the per-key press-attempt counter when we transition to a genuinely
+        # new non-empty key (not the empty-string transient between keys).
+        if self.current_key and self.current_key != self.servo_press_attempts_key:
+            self.servo_press_attempts = 0
+            self.servo_press_attempts_key = self.current_key
+
+        self.set_servo_phase('IDLE')
 
     def on_target_point(self, msg: PointStamped):
         self.current_point = (float(msg.point.x), float(msg.point.y))
@@ -841,8 +870,9 @@ class TypingCoordinator(Node):
         elapsed = now_sec - self.servo_return_start_time
 
         # Wait the grace window before trusting at_target. After the grace, advance as
-        # soon as arm_node reports at_target with a fresh message; if the timeout fires
-        # first, advance anyway and log so the operator sees what happened.
+        # soon as arm_node reports at_target with a fresh message. If the timeout fires
+        # first, halt: motion_enabled -> False, the current key is held for retry, and
+        # mark_done is NOT published. Hardware-only branch: no soft-advance fallback.
         if elapsed < _RETURN_TO_BASE_GRACE_SEC:
             return
 
@@ -856,22 +886,74 @@ class TypingCoordinator(Node):
             return
 
         if timed_out and not arrival_signal:
-            self.get_logger().warn(
-                f"RETURNING_BASE timeout after {elapsed:.2f}s without at_target=true; "
-                "advancing anyway. Check that arm_node is publishing /arm_ik/at_target."
+            # Hardware-only branch: /arm_ik/at_target is a required publisher and the
+            # return move must complete within the timeout. A timeout means the arm
+            # did not physically clear the panel — never advance the queue on that
+            # signal alone. Halt motion, hold the current key for retry, and surface
+            # the fault so the operator inspects the arm before resuming.
+            last_msg_age_str = (
+                f"{now_sec - self.arm_at_target_msg_time:.2f}s ago"
+                if self.arm_at_target_msg_time > 0.0
+                else "never received this session"
             )
+            self.get_logger().error(
+                f"RETURNING_BASE motion fault: {elapsed:.2f}s elapsed without at_target=true "
+                f"(last /arm_ik/at_target message: {last_msg_age_str}). Halting "
+                f"(motion_enabled -> False); current key '{self.current_key}' is held for "
+                f"retry. Move the arm clear of the panel manually, verify "
+                f"`ros2 topic info /arm_ik/at_target` shows an active publisher, then "
+                f"`ros2 param set /typing_coordinator motion_enabled true` to resume."
+            )
+            self.motion_enabled = False
+            self.servo_return_started = False
+            self.servo_return_start_time = 0.0
+            self.last_goal_result = 'return_to_base_motion_fault'
+            self.last_goal_result_message = (
+                f'no at_target after {elapsed:.2f}s; last msg {last_msg_age_str}'
+            )
+            return
 
         self.servo_return_started = False
         self.servo_return_start_time = 0.0
 
         if self.servo_press_succeeded:
+            self.servo_press_attempts = 0
+            self.servo_press_attempts_key = self.current_key
             done_msg = Bool()
             done_msg.data = True
             self.done_pub.publish(done_msg)
             self.set_servo_phase('COMPLETE')
             self.get_logger().info(f"Servo typing completed for '{self.current_key}' after return-to-base")
-        else:
-            self.set_servo_phase('ALIGNING')
+            return
+
+        # Failure path: press didn't succeed (timeout, vision lost, retract). Count
+        # the attempt against the current key; halt motion if we've burned the cap.
+        if self.current_key:
+            if self.current_key != self.servo_press_attempts_key:
+                self.servo_press_attempts_key = self.current_key
+                self.servo_press_attempts = 0
+            self.servo_press_attempts += 1
+            if self.servo_press_attempts >= _MAX_PRESS_ATTEMPTS_PER_KEY:
+                self.get_logger().error(
+                    f"Press failure cap reached for key '{self.current_key}' "
+                    f"({self.servo_press_attempts}/{_MAX_PRESS_ATTEMPTS_PER_KEY} attempts). "
+                    f"Halting (motion_enabled -> False). Inspect occlusion / contact "
+                    f"wiring / alignment, then `ros2 param set /typing_coordinator "
+                    f"motion_enabled true` to resume."
+                )
+                self.motion_enabled = False
+                self.last_goal_result = 'press_attempts_exhausted'
+                self.last_goal_result_message = (
+                    f"{self.servo_press_attempts} failed press attempts on "
+                    f"'{self.current_key}'"
+                )
+                return
+            self.get_logger().warn(
+                f"Press attempt {self.servo_press_attempts}/{_MAX_PRESS_ATTEMPTS_PER_KEY} "
+                f"failed for '{self.current_key}'. Re-aligning."
+            )
+
+        self.set_servo_phase('ALIGNING')
 
     def tick_servo_mode(self, now_sec: float):
         if not self.motion_enabled:
