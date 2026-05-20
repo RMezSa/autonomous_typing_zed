@@ -6,6 +6,18 @@ the second half (sections 8+) is tuning, troubleshooting, and reference.
 
 ---
 
+## 0. First-time setup (Jetson / new machine)
+
+Clone the repo into the ROS 2 workspace:
+
+```bash
+git clone -b feature/strict-hardware-mode https://github.com/RMezSa/autonomous_typing_zed.git ~/ros2_ws/src/autonomous_typing_zed
+```
+
+Then proceed to section 2 (Build) before running anything.
+
+---
+
 ## 1. Environment (every new terminal)
 
 ```bash
