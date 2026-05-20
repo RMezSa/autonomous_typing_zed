@@ -9,6 +9,7 @@ the second half (sections 8+) is tuning, troubleshooting, and reference.
 ## 1. Environment (every new terminal)
 
 ```bash
+export ROS_LOCALHOST_ONLY=1   # prevents phantom-node name collisions over LAN
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
@@ -47,17 +48,17 @@ ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true
 
 Wait for: `arm_node ready. publish_on_action=true max_step=1.50deg/tick @ 50.0Hz`
 
-**Terminal B (vision + coordinator, motion still gated off):**
+**Terminal B (vision + coordinator):**
 
 ```bash
-ros2 launch zed_aruco zed_typing_integration.launch.py
+ros2 launch zed_aruco zed_typing_integration.launch.py motion_enabled:=true
 ```
 
 The launch defaults are already URC-correct:
 - `servo_mode_enabled=true` (closed-loop)
 - `use_tf_targeting=false` (no TF math needed)
 - `require_transform_valid=false`
-- `motion_enabled=false` (master gate)
+- `motion_enabled=true` (passed explicitly — bypasses the phantom-node `param set` race)
 
 ### 3.3 — Confirm topics are alive.
 
@@ -83,10 +84,10 @@ ros2 topic echo /arm_feedback/joint2_deg --once
 # from start_pose_deg=[0,190,-140,-50,0] (the rover's documented rest pose).
 
 # Coordinator picked up the camera intrinsics?
-ros2 topic echo /keyboard/coordinator_debug --once | grep -E "fx|cx"
-# Should show non-700 values once CameraInfo has arrived.
+ros2 topic echo /keyboard/coordinator_debug --once | grep -o '"camera_intrinsics":{[^}]*}'
+# Should show non-700 values for fx/cx once CameraInfo has arrived.
 ```
-
+    
 If any of these fail, stop and fix wiring before continuing.
 
 ---
@@ -104,8 +105,7 @@ window — usually `g` or `h` for Spanish layout).
 Use `/predefined` or `/goal` to position the fingertip directly on that key:
 
 ```bash
-ros2 topic pub /goal std_msgs/msg/Float64MultiArray \
-  "{data: [0.35, 0.0, 0.30, 0.0, 0.0]}" --once
+ros2 topic pub /goal std_msgs/msg/Float64MultiArray "{data: [0.35, 0.0, 0.30, 0.0, 0.0]}" --once
 # Then nudge with more /goal messages until the tip is exactly on the center key.
 ```
 
@@ -137,8 +137,7 @@ camera still seeing the full layout). Then capture the **measured joint angles**
 as the keyboard home (joint-space variant — replays exact joint pose, bypasses IK):
 
 ```bash
-ros2 topic pub /predefined std_msgs/msg/String \
-  "{data: 'SET_KEYBOARD_HOME_JOINTS'}" --once
+ros2 topic pub /predefined std_msgs/msg/String "{data: 'SET_KEYBOARD_HOME_JOINTS'}" --once
 ```
 
 Verify it was captured:
@@ -211,13 +210,17 @@ No `>` prefix needed — the topic infers autonomous vs single-key from length.
 
 Click into the "ArUco Detection" window so it captures keystrokes. Type `>holamundo` + Enter for a word, or a single character + Enter for one key.
 
-### 6.2 — Flip the master gate:
+### 6.2 — Verify motion is armed:
+
+If you launched with `motion_enabled:=true` (section 3.2), the arm is already armed — no action needed. The arm will begin executing keys as soon as the queue has an entry and vision is TRACKING.
+
+If the coordinator self-halted mid-run (retry cap hit, or you launched without the flag), re-arm with:
 
 ```bash
 ros2 param set /typing_coordinator motion_enabled true
 ```
 
-The arm now executes each key in sequence: align → press (max-travel reached) →
+The arm executes each key in sequence: align → press (max-travel reached) →
 retract → return-to-base → next key.
 
 ---
@@ -288,8 +291,8 @@ ros2 topic hz /goal       # should be ~10-12 Hz during ALIGNING
 | Param | Default | Effect |
 |---|---|---|
 | `servo_xy_step_max_m` | `0.003` | Max YZ correction per tick (m). Higher = faster but riskier. |
-| `servo_align_enter_thresh_px` | `8.0` | Pixel error band to enter "aligned." |
-| `servo_align_exit_thresh_px` | `12.0` | Pixel error to leave "aligned" (hysteresis). |
+| `servo_align_enter_thresh_px` | `12.0` | Pixel error band to enter "aligned." |
+| `servo_align_exit_thresh_px` | `20.0` | Pixel error to leave "aligned" (hysteresis). |
 | `servo_ki_y_per_px_per_s` | `0.0001` | Integral gain Y. Set 0 to disable I. |
 | `servo_ki_z_per_px_per_s` | `0.0001` | Integral gain Z. |
 | `servo_deadband_px` | `4.0` | Pixel error inside which P+I contribute zero. |
@@ -376,9 +379,7 @@ If your arm is in a different physical pose at startup:
 - Fix the firmware to publish `/joint_states` so bootstrap is automatic, or
 - Restart arm_node with `start_pose_deg` matching the actual rest pose:
   ```bash
-  ros2 run arm_ik arm_node --ros-args \
-    -p publish_on_action:=true \
-    -p start_pose_deg:='[<q1>, <q2>, <q3>, <q4>, <q5>]'
+  ros2 run arm_ik arm_node --ros-args -p publish_on_action:=true -p start_pose_deg:='[<q1>, <q2>, <q3>, <q4>, <q5>]'
   ```
 
 ---
@@ -388,8 +389,7 @@ If your arm is in a different physical pose at startup:
 For development without a ZED or arm:
 
 ```bash
-ros2 launch zed_aruco no_hardware_integration.launch.py \
-  servo_mode_enabled:=true motion_enabled:=true text:=hola
+ros2 launch zed_aruco no_hardware_integration.launch.py servo_mode_enabled:=true motion_enabled:=true text:=hola
 ```
 
 This swaps in `fake_vision_publisher` and `fake_execute_key_server`.

@@ -634,6 +634,12 @@ class TypingCoordinator(Node):
             },
             'last_goal_result': self.last_goal_result,
             'last_goal_result_message': self.last_goal_result_message,
+            'camera_intrinsics': {
+                'fx': float(self.camera_fx),
+                'fy': float(self.camera_fy),
+                'cx': float(self.camera_cx),
+                'cy': float(self.camera_cy),
+            },
         }
 
         msg = String()
