@@ -2,7 +2,7 @@
 
 This is a one-time setup guide for collaborators who already have **ROS 2 Humble** installed on Ubuntu 22.04. It covers project-specific dependencies, fetching the workspace, and building.
 
-For the actual run-time bring-up after setup, see [`SIM_CHECKPOINT.md`](./SIM_CHECKPOINT.md).
+For the actual run-time bring-up after setup, see [`SIM_CHECKPOINT.md`](./dev/SIM_CHECKPOINT.md).
 
 ---
 
@@ -84,7 +84,7 @@ If Gazebo Fortress opens with the rover and keyboard panel visible, you're set.
 
 ## 5. Run the simulation
 
-Follow [`SIM_CHECKPOINT.md`](./SIM_CHECKPOINT.md) section "Bring-up — 6 terminals" for the full run-time sequence with all calibrated parameters.
+Follow [`SIM_CHECKPOINT.md`](./dev/SIM_CHECKPOINT.md) section "Bring-up — 6 terminals" for the full run-time sequence with all calibrated parameters.
 
 ---
 

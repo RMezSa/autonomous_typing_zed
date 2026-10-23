@@ -63,7 +63,7 @@ Then enable motion after the arm is positioned and calibrated:
 ros2 param set /typing_coordinator motion_enabled true
 ```
 
-See `RUNTIME_COMMANDS.md` for the full URC bring-up sequence with calibration steps.
+See `../RUNTIME_COMMANDS.md` for the full URC bring-up sequence with calibration steps.
 
 ## Architecture
 
